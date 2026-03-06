@@ -14,7 +14,7 @@ from torch.distributed.tensor.experimental import _attention as _dtensor_attenti
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.protocols.model import AttentionMasksType
+from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.tools.logging import logger
 
 _context_parallel_shard = getattr(_dtensor_attention, "_context_parallel_shard", None)

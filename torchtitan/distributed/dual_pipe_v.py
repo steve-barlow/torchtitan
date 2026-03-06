@@ -15,8 +15,8 @@ from torch.distributed.pipelining.stage import _PipelineStageBase
 from torch.distributed.tensor import DeviceMesh, distribute_module
 from torch.profiler import record_function
 
+from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig
 from torchtitan.distributed.expert_parallel import BaseExpertParallel
-
 from torchtitan.tools.utils import get_device_info
 
 _Action = _schedules._Action
@@ -35,7 +35,12 @@ Below are optimizations related to pipeline parallelism with expert parallelism
 """
 
 
-def get_dual_pipe_v_flag(job_config, parallel_dims) -> bool:
+def get_dual_pipe_v_flag(
+    *,
+    parallelism: ParallelismConfig,
+    ac_config: ActivationCheckpointConfig,
+    parallel_dims: ParallelDims,
+) -> bool:
     """
     Determine if DualPipeV should be enabled based on config and
     validates that incompatible features (EP + DualPipeV + AC) are not used together.
@@ -44,11 +49,11 @@ def get_dual_pipe_v_flag(job_config, parallel_dims) -> bool:
         return False
 
     dual_pipe_v = (
-        job_config.parallelism.pipeline_parallel_expert_parallel_overlap
-        and job_config.parallelism.pipeline_parallel_schedule.lower() == "dualpipev"
+        parallelism.pipeline_parallel_expert_parallel_overlap
+        and parallelism.pipeline_parallel_schedule.lower() == "dualpipev"
     )
 
-    if dual_pipe_v and job_config.activation_checkpoint.mode != "none":
+    if dual_pipe_v and ac_config.mode != "none":
         raise NotImplementedError(
             "Expert Parallel with DualPipeV and Activation Checkpointing "
             "cannot be used together. Please disable one of them."
@@ -124,7 +129,7 @@ class HookCoordinator:
         except threading.BrokenBarrierError:
             pass
 
-    def enable_coordination(self, num_layers: Optional[int] = None):
+    def enable_coordination(self, num_layers: int | None = None):
         if num_layers is not None and num_layers > 0:
             self._coordination_enabled = True
             self._cycle_count = 0
@@ -181,7 +186,7 @@ class SyncHook(torch.autograd.Function):
 
 def _count_moe_modules(model):
     """Count MoE modules directly"""
-    from torchtitan.models.moe import MoE
+    from torchtitan.models.common.moe import MoE
 
     moe_count = 0
     for _, module in model.named_modules():
