@@ -60,6 +60,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output_dir")
     parser.add_argument(
+        "--gpu_arch_type",
+        default="cuda",
+        choices=["cuda", "rocm"],
+        help="GPU architecture type. Must be specified as either 'cuda' or 'rocm'.",
+    )
+    parser.add_argument(
         "--config_path",
         default="./tests/integration_tests/base_config.toml",
         help="Base config path for integration tests. This is the config that will be used as a base for all tests.",
