@@ -249,6 +249,7 @@ class CheckpointManager:
         self.enable_staging = (
             self.enable and async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM
         ) or self.enable_ft_dataloader_checkpoints
+        self.pending_ready_checkpoint_id: str | None = None
 
         if not self.enable and not self.enable_ft_dataloader_checkpoints:
             return
@@ -330,7 +331,10 @@ class CheckpointManager:
         self.close()
 
     def close(self):
-        if hasattr(self, "enable") and self.enable:
+        if hasattr(self, "enable") and (
+            self.enable or self.enable_ft_dataloader_checkpoints
+        ):
+            self._async_wait()
             if hasattr(self, "mp") and self.mp and self.mp.is_alive():
                 self.mp_queue_send.put(Terminate())
                 self.mp.join()
@@ -344,6 +348,17 @@ class CheckpointManager:
 
             if self.stager is not None:
                 self.stager.close()
+
+    def _write_ready_marker(self, checkpoint_id: str) -> None:
+        ready_marker_path = os.path.join(checkpoint_id, "_READY")
+        with open(ready_marker_path, "wb"):
+            pass
+
+    def _finalize_pending_ready_marker(self) -> None:
+        if self.pending_ready_checkpoint_id is None:
+            return
+        self._write_ready_marker(self.pending_ready_checkpoint_id)
+        self.pending_ready_checkpoint_id = None
 
     @torch.no_grad()
     def dcp_save(
@@ -540,6 +555,9 @@ class CheckpointManager:
                     async_mode=AsyncMode.DISABLED,
                     enable_garbage_collection=True,
                 )
+                self._write_ready_marker(checkpoint_id)
+            if self.async_mode != AsyncMode.DISABLED:
+                self.pending_ready_checkpoint_id = checkpoint_id
             self._purge_stale_checkpoints()
 
             logger.info(
@@ -802,13 +820,16 @@ class CheckpointManager:
                 self.last_save_model_only
             ), "Only model can be saved when saving in HF safetensors format."
 
+        checkpoint_id = self._create_checkpoint_id(curr_step)
         self.dcp_save(
             states,
-            checkpoint_id=self._create_checkpoint_id(curr_step),
+            checkpoint_id=checkpoint_id,
             async_mode=AsyncMode.DISABLED,
             enable_garbage_collection=True,
             to_hf=self.last_save_in_hf,
         )
+        if not self.last_save_in_hf:
+            self._write_ready_marker(checkpoint_id)
 
     def _should_save(self, curr_step: int, last_step: bool = False) -> bool:
         if not self.enable or self.load_only:
@@ -829,12 +850,15 @@ class CheckpointManager:
         if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
             if self.save_future is not None:
                 self.save_future.result()
+                self.save_future = None
+                self._finalize_pending_ready_marker()
         elif (
             self.async_mode == AsyncMode.ASYNC or self.enable_ft_dataloader_checkpoints
         ):
             if self.save_future is not None:
                 self.save_future.result()
                 self.save_future = None
+                self._finalize_pending_ready_marker()
         elif self.save_future is not None:
             raise RuntimeError(
                 "self.save_future is not None, but self.async_mode is not enabled "
