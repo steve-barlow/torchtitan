@@ -575,9 +575,9 @@ def compute_grpo_advantages(
         advantages: [batch]
     """
     batch_size = rewards.shape[0]
-    assert (
-        batch_size % group_size == 0
-    ), f"Batch size {batch_size} must be divisible by group_size {group_size}"
+    assert batch_size % group_size == 0, (
+        f"Batch size {batch_size} must be divisible by group_size {group_size}"
+    )
 
     num_groups = batch_size // group_size
     rewards_grouped = rewards.view(num_groups, group_size)
@@ -615,9 +615,9 @@ def compute_grpo_advantages_stable(
         advantages: [batch]
     """
     batch_size = rewards.shape[0]
-    assert (
-        batch_size % group_size == 0
-    ), f"Batch size {batch_size} must be divisible by group_size {group_size}"
+    assert batch_size % group_size == 0, (
+        f"Batch size {batch_size} must be divisible by group_size {group_size}"
+    )
 
     num_groups = batch_size // group_size
     rewards_grouped = rewards.view(num_groups, group_size)

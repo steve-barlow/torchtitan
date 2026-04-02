@@ -40,8 +40,7 @@ class BaseDataLoader(Stateful, ABC):
     """
 
     @abstractmethod
-    def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
-        ...
+    def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]: ...
 
 
 class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):

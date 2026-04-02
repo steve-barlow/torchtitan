@@ -260,9 +260,9 @@ def data_parallel(
     elif mode == "hybrid_shard":
         # replicate inter-host, fully shard intra-host
         param_sharding = (Replicate(), Shard(shard_dim))
-        assert (
-            device_mesh.ndim == 2
-        ), "hybrid sharded data parallel requires 2D DeviceMesh"
+        assert device_mesh.ndim == 2, (
+            "hybrid sharded data parallel requires 2D DeviceMesh"
+        )
     else:
         raise ValueError(f"Unsupported mode {mode}")
 

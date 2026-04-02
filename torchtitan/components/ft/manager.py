@@ -125,9 +125,9 @@ def maybe_semi_sync_training(
     if extend_ft_config.enable and semi_sync_method is not None:
         from torchft import local_sgd
 
-        assert (
-            ft_manager._manager is not None
-        ), "FTManager must be enabled to use semi-sync training."
+        assert ft_manager._manager is not None, (
+            "FTManager must be enabled to use semi-sync training."
+        )
         logger.info(
             f"using fragment function to split model: {fragment_fn is not None}"
         )

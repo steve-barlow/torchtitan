@@ -152,9 +152,9 @@ class VLLMCompatibleFlashAttention(torch.nn.Module):
                 # Each KV head serves (num_heads // num_kv_heads) Q heads
                 if num_kv_heads < num_heads:
                     assert enable_gqa, "GQA requires enable_gqa=True"
-                    assert (
-                        num_heads % num_kv_heads == 0
-                    ), "num_heads must be a multiple of num_kv_heads"
+                    assert num_heads % num_kv_heads == 0, (
+                        "num_heads must be a multiple of num_kv_heads"
+                    )
                     n_rep = num_heads // num_kv_heads
                     k_t = k_t.repeat_interleave(n_rep, dim=1)
                     v_t = v_t.repeat_interleave(n_rep, dim=1)
@@ -208,9 +208,9 @@ class VLLMCompatibleFlashAttention(torch.nn.Module):
                 # For GQA, we need to reduce grad_k and grad_v back to num_kv_heads
                 if num_kv_heads < num_heads:
                     assert enable_gqa, "GQA requires enable_gqa=True"
-                    assert (
-                        num_heads % num_kv_heads == 0
-                    ), "num_heads must be a multiple of num_kv_heads"
+                    assert num_heads % num_kv_heads == 0, (
+                        "num_heads must be a multiple of num_kv_heads"
+                    )
                     n_rep = num_heads // num_kv_heads
                     # Reshape and sum over the repeated dimension
                     grad_k_t = grad_k_t.reshape(

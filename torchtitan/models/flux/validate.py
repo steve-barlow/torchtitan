@@ -226,12 +226,15 @@ class FluxValidator(Validator):
                 from torchtitan.distributed.context_parallel import cp_shard
 
                 (
-                    latents,
-                    latent_pos_enc,
-                    t5_encodings,
-                    text_pos_enc,
-                    target,
-                ), _ = cp_shard(
+                    (
+                        latents,
+                        latent_pos_enc,
+                        t5_encodings,
+                        text_pos_enc,
+                        target,
+                    ),
+                    _,
+                ) = cp_shard(
                     parallel_dims.get_mesh("cp"),
                     (latents, latent_pos_enc, t5_encodings, text_pos_enc, target),
                     None,  # No attention masks for Flux

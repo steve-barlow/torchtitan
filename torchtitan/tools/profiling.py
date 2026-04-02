@@ -61,9 +61,9 @@ def maybe_enable_profiling(
             os.makedirs(trace_dir, exist_ok=True)
 
         wait = profile_freq - (active + warmup)
-        assert (
-            wait >= 0
-        ), "profile_freq must be greater than or equal to warmup + active"
+        assert wait >= 0, (
+            "profile_freq must be greater than or equal to warmup + active"
+        )
         gpu_device_profiled = None
         if torch.cuda.is_available():
             gpu_device_profiled = torch.profiler.ProfilerActivity.CUDA
@@ -141,7 +141,7 @@ def maybe_enable_memory_snapshot(
         profiler = MemoryProfiler(global_step, profiling_config.profile_freq)
         try:
             yield profiler
-        except torch.OutOfMemoryError as e:
+        except torch.OutOfMemoryError:
             profiler.step(exit_ctx=True)
             raise
     else:

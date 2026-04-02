@@ -112,9 +112,9 @@ class FluxTrainer(Trainer):
             torch.Tensor: The computed loss value for this training step
         """
 
-        assert (
-            global_valid_tokens is None
-        ), "FLUX model don't need to rescale loss by number of global valid tokens"
+        assert global_valid_tokens is None, (
+            "FLUX model don't need to rescale loss by number of global valid tokens"
+        )
 
         # generate t5 and clip embeddings
         input_dict["image"] = labels
@@ -176,12 +176,15 @@ class FluxTrainer(Trainer):
             from torchtitan.distributed.context_parallel import cp_shard
 
             (
-                latents,
-                latent_pos_enc,
-                t5_encodings,
-                text_pos_enc,
-                target,
-            ), _ = cp_shard(
+                (
+                    latents,
+                    latent_pos_enc,
+                    t5_encodings,
+                    text_pos_enc,
+                    target,
+                ),
+                _,
+            ) = cp_shard(
                 self.parallel_dims.get_mesh("cp"),
                 (latents, latent_pos_enc, t5_encodings, text_pos_enc, target),
                 None,  # No attention masks for Flux

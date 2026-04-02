@@ -44,7 +44,11 @@ def _permute(x, num_tokens_per_expert, ep_degree, num_local_experts):
     x_padded_per_expert = x.shape[0] + num_local_experts * TOKEN_GROUP_ALIGN_SIZE_M
     padded_max_len = _round_up(x_padded_per_expert, TOKEN_GROUP_ALIGN_SIZE_M)
     with torch.no_grad():
-        (permuted_indices, num_tokens_per_expert, _offsets,) = generate_permute_indices(
+        (
+            permuted_indices,
+            num_tokens_per_expert,
+            _offsets,
+        ) = generate_permute_indices(
             num_tokens_per_expert,
             num_local_experts,
             ep_degree,

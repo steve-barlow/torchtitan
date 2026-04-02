@@ -976,9 +976,9 @@ class Validation:
     """DataLoader configuration"""
 
     def __post_init__(self):
-        assert (
-            self.steps > 0 or self.steps == -1
-        ), "validation steps must be positive or -1"
+        assert self.steps > 0 or self.steps == -1, (
+            "validation steps must be positive or -1"
+        )
 
 
 @dataclass

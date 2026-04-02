@@ -30,6 +30,7 @@ else:
     class _PipelineContext(Protocol):
         schedule_ref: Any
 
+
 """
 Below are optimizations related to pipeline parallelism with expert parallelism
 """

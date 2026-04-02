@@ -220,8 +220,7 @@ def validate_arguments(
         log_print("Error: All settings are identical")
         log_print("       Cannot compare identical configurations")
         log_print(
-            "       Please provide different commits, configs, train files, "
-            "or options"
+            "       Please provide different commits, configs, train files, or options"
         )
         log_print(
             "       Or use --import-result with --assert-equal "
@@ -242,9 +241,7 @@ def validate_arguments(
 
     # Validate export-result and import-result are mutually exclusive
     if export_result and import_result:
-        log_print(
-            "Error: --export-result and --import-result cannot be " "used together"
-        )
+        log_print("Error: --export-result and --import-result cannot be used together")
         log_print(
             "       Use export to save results or import to compare "
             "against saved results"
@@ -490,7 +487,7 @@ def run_training(
     """Run training for a specific scenario. Returns the log file path."""
     log_file = get_log_path(scenario, output_folder)
     log_print(
-        f"Running training with {scenario} commit and logging output " f"to {log_file}"
+        f"Running training with {scenario} commit and logging output to {log_file}"
     )
 
     # Build the final command
@@ -679,8 +676,7 @@ def perform_loss_analysis(
                 stats_file,
             )
             log_and_save(
-                f"{LOG_PREFIX} Please check that the training completed "
-                "successfully.",
+                f"{LOG_PREFIX} Please check that the training completed successfully.",
                 stats_file,
             )
             return
@@ -805,8 +801,7 @@ def assert_losses_equal(
     else:
         if test_log and import_result:
             log_print(
-                "All losses are equal (baseline, test, and imported). "
-                "Assertion passed!"
+                "All losses are equal (baseline, test, and imported). Assertion passed!"
             )
         elif test_log:
             log_print("All losses are equal (baseline and test). Assertion passed!")
@@ -863,8 +858,7 @@ def print_completion_summary(
     else:
         if baseline_only_mode:
             log_print(
-                "Baseline run complete. No results saved "
-                "(no output folder specified)."
+                "Baseline run complete. No results saved (no output folder specified)."
             )
         else:
             log_print(

@@ -117,7 +117,6 @@ def parallelize_deepseekv3(
     set_torchtitan_fields(model, parallel_mod)
 
     if loss_parallel_enabled:
-
         # current PyTorch's implementation of loss parallel assumes
         # that the DTensor has a 1d device mesh. This is not true
         # in our case, but we can work around it by adding

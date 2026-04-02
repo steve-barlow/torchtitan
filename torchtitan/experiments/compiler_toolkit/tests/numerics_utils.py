@@ -38,7 +38,6 @@ def compare_metrics(metrics1, metrics2, label1="Eager", label2="Compiled"):
     all_match = True
 
     for metric_name in sorted(all_metrics):
-
         steps1 = set(metrics1[metric_name].keys())
         steps2 = set(metrics2[metric_name].keys())
 

@@ -160,15 +160,11 @@ def generate_image(
         enable_classifier_free_guidance=enable_classifier_free_guidance,
         empty_t5_encodings=(
             # pyrefly: ignore [unbound-name]
-            empty_batch["t5_encodings"]
-            if enable_classifier_free_guidance
-            else None
+            empty_batch["t5_encodings"] if enable_classifier_free_guidance else None
         ),
         empty_clip_encodings=(
             # pyrefly: ignore [unbound-name]
-            empty_batch["clip_encodings"]
-            if enable_classifier_free_guidance
-            else None
+            empty_batch["clip_encodings"] if enable_classifier_free_guidance else None
         ),
         # pyrefly: ignore [missing-attribute]
         classifier_free_guidance_scale=job_config.validation.classifier_free_guidance_scale,

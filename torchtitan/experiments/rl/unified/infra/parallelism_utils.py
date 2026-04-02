@@ -11,7 +11,6 @@ This module provides functions for setting up device mesh and applying
 tensor parallelism to TorchTitan models in vLLM using TorchTitan's ParallelDims.
 """
 
-
 import torch.distributed as dist
 from torchtitan.config.job_config import Comm, JobConfig, Model, Parallelism, Training
 from torchtitan.distributed import utils as dist_utils

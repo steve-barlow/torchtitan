@@ -178,13 +178,11 @@ def test_generate(
 
     # Tokenize prompt and repeat batch_size times
     input_ids = (
-        (
-            torch.tensor(
-                tokenizer.encode(prompt, add_bos=True, add_eos=False), dtype=torch.long
-            )
-            .view(1, -1)
-            .repeat(batch_size, 1)
+        torch.tensor(
+            tokenizer.encode(prompt, add_bos=True, add_eos=False), dtype=torch.long
         )
+        .view(1, -1)
+        .repeat(batch_size, 1)
     ).to(device_type)
 
     device_memory_monitor.reset_peak_stats()

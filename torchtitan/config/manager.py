@@ -254,7 +254,6 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------------
 
     try:
-
         # pyrefly: ignore[missing-import]
         from rich import print as rprint
 

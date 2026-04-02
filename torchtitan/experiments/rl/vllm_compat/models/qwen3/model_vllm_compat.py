@@ -218,9 +218,9 @@ class Attention(nn.Module):
         xv = values.transpose(1, 2)
 
         # Apply flash attention (vLLM compatible, no flex attention)
-        assert (
-            attention_masks is None
-        ), "vLLM compat mode doesn't use flex attention masks"
+        assert attention_masks is None, (
+            "vLLM compat mode doesn't use flex attention masks"
+        )
         output = self.inner_attention(xq, xk, xv, scale=self.scaling)
 
         # Transpose back

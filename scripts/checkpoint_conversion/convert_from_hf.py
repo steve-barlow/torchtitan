@@ -26,9 +26,9 @@ def convert_from_hf(input_dir, output_dir, model_name, model_flavor):
 
     # pyrefly: ignore[bad-instantiation, not-callable]
     sd_adapter = train_spec.state_dict_adapter(model_args, None)
-    assert (
-        sd_adapter is not None
-    ), "trying to convert checkpoint from HF to DCP safetensors format, but sd_adapter is not provided."
+    assert sd_adapter is not None, (
+        "trying to convert checkpoint from HF to DCP safetensors format, but sd_adapter is not provided."
+    )
     # get state dict in tt format with allocated memory
     state_dict = model._get_state_dict()
     # convert empty state dict to hf format so that hf weights can be loaded into it

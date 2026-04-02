@@ -49,9 +49,9 @@ class LRSchedulersContainer(Stateful):
     schedulers: list[LRScheduler]
 
     def __init__(self, optimizers: OptimizersContainer, lr_lambda: Callable) -> None:
-        assert (
-            len(optimizers) > 0
-        ), "Must have at least one optimizer to create LRScheduler"
+        assert len(optimizers) > 0, (
+            "Must have at least one optimizer to create LRScheduler"
+        )
 
         self.schedulers = [LambdaLR(optimizer, lr_lambda) for optimizer in optimizers]
 
@@ -165,9 +165,9 @@ def build_lr_schedulers(
             # linear warmup
             # 0-indexed step, hence + 1 adjustments
             current_step += 1
-            assert (
-                warmup_steps != 0
-            ), "warmup_steps must not be zero to reach this branch"
+            assert warmup_steps != 0, (
+                "warmup_steps must not be zero to reach this branch"
+            )
             curr_adjustment = float(current_step / warmup_steps)
         elif current_step < warmup_stable_steps:
             curr_adjustment = 1.0

@@ -97,7 +97,7 @@ def create_extra_fsdp_pg(parallel_dims: ParallelDims) -> None:
     )
     _EXTRA_FSDP_PG_REGISTRY[original_name] = pg.group_name
     logger.info(
-        f"Created extra FSDP PG " f"(original: {original_name}, extra: {pg.group_name})"
+        f"Created extra FSDP PG (original: {original_name}, extra: {pg.group_name})"
     )
 
 

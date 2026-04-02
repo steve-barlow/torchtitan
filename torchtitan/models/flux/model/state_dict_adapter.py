@@ -270,9 +270,9 @@ class FluxStateDictAdapter(StateDictAdapter):
                 tt_abstract_key = self.reverse_combination_plan[key]
                 if tt_abstract_key is None:
                     continue
-                to_combine[tt_abstract_key.format(layer_num)][
-                    key.format(layer_num)
-                ] = value
+                to_combine[tt_abstract_key.format(layer_num)][key.format(layer_num)] = (
+                    value
+                )
 
         # combine collected values
         for tt_fqn, hf_fqn_map in to_combine.items():

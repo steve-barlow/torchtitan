@@ -190,12 +190,12 @@ class Float8GroupedMMConverter(QuantizationConverter):
             )
 
         # Validate MoE training prototype limitations.
-        assert (
-            job_config.parallelism.pipeline_parallel_degree == 1
-        ), "Float8 MoE training prototype does not yet support pipeline parallelism"
-        assert (
-            job_config.parallelism.context_parallel_degree == 1
-        ), "Float8 MoE training prototype does not yet support context parallelism"
+        assert job_config.parallelism.pipeline_parallel_degree == 1, (
+            "Float8 MoE training prototype does not yet support pipeline parallelism"
+        )
+        assert job_config.parallelism.context_parallel_degree == 1, (
+            "Float8 MoE training prototype does not yet support context parallelism"
+        )
 
         # For fp8 grouped GEMM, token group sizes must be multiples of 16
         # (16 byte alignment / 1 byte per elem = 16 elements)

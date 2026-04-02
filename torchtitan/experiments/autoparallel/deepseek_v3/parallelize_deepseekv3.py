@@ -351,7 +351,9 @@ def parallelize_deepseekv3(
         }
         assert all(
             name in possible_input_shardings for name in sparse_mesh.mesh_dim_names
-        ), f"Unsupported mesh dim in world mesh, only {possible_input_shardings.keys()} are supported by AutoParallel"
+        ), (
+            f"Unsupported mesh dim in world mesh, only {possible_input_shardings.keys()} are supported by AutoParallel"
+        )
         x_sharding = tuple(
             possible_input_shardings[name] for name in sparse_mesh.mesh_dim_names
         )
@@ -377,7 +379,6 @@ def parallelize_deepseekv3(
     set_torchtitan_fields(model, parallel_mod)
 
     if loss_parallel_enabled:
-
         # current PyTorch's implementation of loss parallel assumes
         # that the DTensor has a 1d device mesh. This is not true
         # in our case, but we can work around it by adding

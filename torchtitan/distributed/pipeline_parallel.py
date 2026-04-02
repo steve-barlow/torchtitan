@@ -69,7 +69,6 @@ def pipeline_llm(
 
     # Calculate number of virtual stages
     if layers_per_stage is not None:
-
         # Calculate number of virtual stages needed (using ceiling division)
         # This allows for unequal distribution where stages can differ by at most 1 layer
         num_virtual_stages = math.ceil(
@@ -453,16 +452,16 @@ def pipeline_module_split(
         Compute the stage ids for the stages that will run on this pp rank
         for either a looped or V style schedule
         """
-        assert (
-            num_stages % pp_degree == 0
-        ), f"num_stages {num_stages} must be evenly divisible by pp_degree {pp_degree}"
+        assert num_stages % pp_degree == 0, (
+            f"num_stages {num_stages} must be evenly divisible by pp_degree {pp_degree}"
+        )
         stages_per_rank = num_stages // pp_degree
         if style == "loop":
             return tuple(pp_rank + s * pp_degree for s in range(stages_per_rank))
         elif style == "v":
-            assert (
-                stages_per_rank == 2
-            ), f"v schedules assume 2 stages per rank, got {stages_per_rank}"
+            assert stages_per_rank == 2, (
+                f"v schedules assume 2 stages per rank, got {stages_per_rank}"
+            )
             stage_v_pairs = list(
                 zip(range(pp_degree), range(num_stages - 1, pp_degree - 1, -1))
             )

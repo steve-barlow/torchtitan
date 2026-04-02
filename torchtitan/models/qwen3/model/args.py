@@ -21,7 +21,6 @@ from torchtitan.tools.logging import logger
 
 @dataclass
 class Qwen3ModelArgs(BaseModelArgs):
-
     dim: int = 1024
     n_layers: int = 28
     n_heads: int = 16

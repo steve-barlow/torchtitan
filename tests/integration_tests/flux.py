@@ -101,9 +101,9 @@ def run_tests(args, test_list: list[OverrideDefinitions]):
 
     # Check if config file exists
     assert args.config_path.endswith(".toml"), "Base config path must end with .toml"
-    assert os.path.exists(
-        args.config_path
-    ), f"Base config path {args.config_path} does not exist"
+    assert os.path.exists(args.config_path), (
+        f"Base config path {args.config_path} does not exist"
+    )
 
     for test_flavor in test_list:
         # Filter by test_name if specified

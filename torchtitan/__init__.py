@@ -11,5 +11,5 @@ import torchtitan.components.quantization  # noqa: F401
 
 try:
     __version__ = version("torchtitan")
-except Exception as e:
+except Exception:
     __version__ = "0.0.0+unknown"

@@ -81,9 +81,9 @@ class Llama4StateDictAdapter(StateDictAdapter):
                 # pyrefly: ignore [unnecessary-comparison]
                 if hf_abstract_key is None:
                     continue
-                to_combine[hf_abstract_key.format(layer_num)][
-                    key.format(layer_num)
-                ] = value
+                to_combine[hf_abstract_key.format(layer_num)][key.format(layer_num)] = (
+                    value
+                )
 
         # combine collected values
         for hf_fqn, tt_fqn_map in to_combine.items():

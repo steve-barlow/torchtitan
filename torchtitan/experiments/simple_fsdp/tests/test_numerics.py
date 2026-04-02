@@ -109,7 +109,11 @@ class TestSimpleFSDP(FSDPTest):
             copy.deepcopy(model), inputs, labels
         )
 
-        for (fsdp2_loss, simple_fsdp_loss, simple_fsdp_compiled_aot_eager_loss,) in zip(
+        for (
+            fsdp2_loss,
+            simple_fsdp_loss,
+            simple_fsdp_compiled_aot_eager_loss,
+        ) in zip(
             fsdp2_losses,
             simple_fsdp_losses,
             simple_fsdp_compiled_aot_eager_losses,
@@ -129,7 +133,11 @@ class TestSimpleFSDP(FSDPTest):
             copy.deepcopy(model), inputs, labels
         )
 
-        for (fsdp2_loss, simple_fsdp_loss, simple_fsdp_compiled_aot_eager_loss,) in zip(
+        for (
+            fsdp2_loss,
+            simple_fsdp_loss,
+            simple_fsdp_compiled_aot_eager_loss,
+        ) in zip(
             fsdp2_losses,
             simple_fsdp_losses,
             simple_fsdp_compiled_aot_eager_losses,
@@ -149,7 +157,11 @@ class TestSimpleFSDP(FSDPTest):
             copy.deepcopy(model), inputs, labels
         )
 
-        for (fsdp2_loss, simple_fsdp_loss, simple_fsdp_compiled_aot_eager_loss,) in zip(
+        for (
+            fsdp2_loss,
+            simple_fsdp_loss,
+            simple_fsdp_compiled_aot_eager_loss,
+        ) in zip(
             fsdp2_losses,
             simple_fsdp_losses,
             simple_fsdp_compiled_aot_eager_losses,

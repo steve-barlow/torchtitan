@@ -21,8 +21,7 @@ class ModelConverter(Protocol):
         - Fused optimized layers (e.g. flash-attention, norms, ...)
     """
 
-    def __init__(self, job_config: JobConfig, parallel_dims: ParallelDims):
-        ...
+    def __init__(self, job_config: JobConfig, parallel_dims: ParallelDims): ...
 
     def convert(self, model: nn.Module):
         """Inplace conversion of the model."""
@@ -44,9 +43,9 @@ def register_model_converter(converter_cls: type[ModelConverter], name: str):
     A registered model converter can be applied on any model
     using the `model.converters` config parameter.
     """
-    assert (
-        name not in _registry_model_converter_cls
-    ), f"A model converter '{name}' is already registered."
+    assert name not in _registry_model_converter_cls, (
+        f"A model converter '{name}' is already registered."
+    )
     _registry_model_converter_cls[name] = converter_cls
 
 

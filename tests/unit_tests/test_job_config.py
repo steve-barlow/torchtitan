@@ -86,9 +86,9 @@ class TestJobConfig(unittest.TestCase):
                 )
             config_manager = ConfigManager()
             config = config_manager.parse_args(["--job.config_file", fp.name])
-            assert (
-                config.parallelism.module_fqns_per_model_part == toml_chunks
-            ), config.parallelism.module_fqns_per_model_part
+            assert config.parallelism.module_fqns_per_model_part == toml_chunks, (
+                config.parallelism.module_fqns_per_model_part
+            )
 
         # test that the field accepts list of lists structure
         with tempfile.NamedTemporaryFile() as fp:
@@ -103,9 +103,9 @@ class TestJobConfig(unittest.TestCase):
                 )
             config_manager = ConfigManager()
             config = config_manager.parse_args(["--job.config_file", fp.name])
-            assert (
-                config.parallelism.module_fqns_per_model_part == cmdline_chunks
-            ), config.parallelism.module_fqns_per_model_part
+            assert config.parallelism.module_fqns_per_model_part == cmdline_chunks, (
+                config.parallelism.module_fqns_per_model_part
+            )
 
         # test empty chunks are handled correctly
         empty_chunks = [[], ["tok_embeddings"], []]
@@ -121,9 +121,9 @@ class TestJobConfig(unittest.TestCase):
                 )
             config_manager = ConfigManager()
             config = config_manager.parse_args(["--job.config_file", fp.name])
-            assert (
-                config.parallelism.module_fqns_per_model_part == empty_chunks
-            ), config.parallelism.module_fqns_per_model_part
+            assert config.parallelism.module_fqns_per_model_part == empty_chunks, (
+                config.parallelism.module_fqns_per_model_part
+            )
 
     def test_parse_exclude_from_loading(self):
         toml_splits = ["optimizer", "dataloader"]
@@ -148,9 +148,9 @@ class TestJobConfig(unittest.TestCase):
                 ",".join(cmdline_splits),
             ]
         )
-        assert (
-            config.checkpoint.exclude_from_loading == cmdline_splits
-        ), config.checkpoint.exclude_from_loading
+        assert config.checkpoint.exclude_from_loading == cmdline_splits, (
+            config.checkpoint.exclude_from_loading
+        )
 
         # toml has split points, cmdline does not
         with tempfile.NamedTemporaryFile() as fp:
@@ -165,9 +165,9 @@ class TestJobConfig(unittest.TestCase):
                 )
             config_manager = ConfigManager()
             config = config_manager.parse_args(["--job.config_file", fp.name])
-            assert (
-                config.checkpoint.exclude_from_loading == toml_splits
-            ), config.checkpoint.exclude_from_loading
+            assert config.checkpoint.exclude_from_loading == toml_splits, (
+                config.checkpoint.exclude_from_loading
+            )
 
         # toml has split points, cmdline overrides them
         with tempfile.NamedTemporaryFile() as fp:
@@ -189,9 +189,9 @@ class TestJobConfig(unittest.TestCase):
                     ",".join(cmdline_splits),
                 ]
             )
-            assert (
-                config.checkpoint.exclude_from_loading == cmdline_splits
-            ), config.checkpoint.exclude_from_loading
+            assert config.checkpoint.exclude_from_loading == cmdline_splits, (
+                config.checkpoint.exclude_from_loading
+            )
 
     def test_job_config_model_converters_split(self):
         config_manager = ConfigManager()
@@ -317,12 +317,15 @@ class TestJobConfig(unittest.TestCase):
             assert isinstance(result, dict)
 
     def test_job_config_invalid_field(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            r"Invalid field names in .* data: .*\.\n"
-            r"Please modify your \.toml config file or override these fields from the command line\.\n"
-            r"Run `NGPU=1 \./run_train\.sh --help` to read all valid fields\.",
-        ), tempfile.NamedTemporaryFile() as fp:
+        with (
+            self.assertRaisesRegex(
+                ValueError,
+                r"Invalid field names in .* data: .*\.\n"
+                r"Please modify your \.toml config file or override these fields from the command line\.\n"
+                r"Run `NGPU=1 \./run_train\.sh --help` to read all valid fields\.",
+            ),
+            tempfile.NamedTemporaryFile() as fp,
+        ):
             with open(fp.name, "wb") as f:
                 tomli_w.dump(
                     {

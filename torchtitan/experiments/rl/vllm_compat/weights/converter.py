@@ -42,7 +42,7 @@ VLLM_TO_TITAN_MAP = {
 
 
 def vllm_to_torchtitan(
-    vllm_path_or_state: str | dict[str, torch.Tensor]
+    vllm_path_or_state: str | dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     """
     Load weights from vLLM format (HuggingFace) and convert to TorchTitan format.

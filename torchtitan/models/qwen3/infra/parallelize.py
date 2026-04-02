@@ -76,9 +76,7 @@ def parallelize_qwen3(
     parallel_dims: ParallelDims,
     job_config: JobConfig,
 ):
-    assert (
-        job_config.training.seq_len % parallel_dims.seq_len_divisor == 0
-    ), f"""
+    assert job_config.training.seq_len % parallel_dims.seq_len_divisor == 0, f"""
         Sequence length {job_config.training.seq_len} must be divisible by the product of TP degree
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """

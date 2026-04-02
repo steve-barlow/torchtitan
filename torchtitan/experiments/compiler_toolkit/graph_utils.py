@@ -132,7 +132,10 @@ def joint_graph_builder(
         assert isinstance(arg, DTensor), f"Argument {idx} is of type {type(arg)}"
 
     # get joint graph
-    (joint_with_descriptors, tracing_context,) = export_joint(
+    (
+        joint_with_descriptors,
+        tracing_context,
+    ) = export_joint(
         model,
         model_args,
         model_kwargs,
@@ -371,9 +374,9 @@ def validate_pass_names(pass_names: list[str], joint_pass_names: list[str]) -> N
         ValueError: If pass configuration is invalid
     """
     if "cudagraph" in pass_names:
-        assert (
-            pass_names[-1] == "cudagraph"
-        ), "cudagraph has to be the last pass to apply"
+        assert pass_names[-1] == "cudagraph", (
+            "cudagraph has to be the last pass to apply"
+        )
 
     if (
         "autobucketing_reordering" in pass_names

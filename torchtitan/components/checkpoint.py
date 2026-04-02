@@ -274,9 +274,9 @@ class CheckpointManager:
         self.last_save_model_only = checkpoint_config.last_save_model_only
         self.last_save_in_hf = checkpoint_config.last_save_in_hf
         if self.last_save_in_hf:
-            assert (
-                sd_adapter is not None
-            ), "job_config.checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
+            assert sd_adapter is not None, (
+                "job_config.checkpoint.last_save_in_hf is True, but sd_adapter is not provided."
+            )
         self.sd_adapter = sd_adapter
         self.export_dtype = TORCH_DTYPE_MAP[checkpoint_config.export_dtype]
         self.exclude_from_loading = checkpoint_config.exclude_from_loading
@@ -387,9 +387,9 @@ class CheckpointManager:
         checkpoint_save_id: str | None = None
         fqn_to_index_mapping: dict[Any, int] | None = None
         if to_hf:
-            assert (
-                self.sd_adapter is not None
-            ), "trying to save checkpoint in HF safetensors format, but sd_adapter is not provided."
+            assert self.sd_adapter is not None, (
+                "trying to save checkpoint in HF safetensors format, but sd_adapter is not provided."
+            )
             state_dict = self.sd_adapter.to_hf(state_dict)
 
             fqn_to_index_mapping = self.sd_adapter.fqn_to_index_mapping
@@ -466,9 +466,9 @@ class CheckpointManager:
         """
 
         if from_hf:
-            assert (
-                self.sd_adapter is not None
-            ), "trying to load checkpoint in HF safetensors format, but sd_adapter is not provided."
+            assert self.sd_adapter is not None, (
+                "trying to load checkpoint in HF safetensors format, but sd_adapter is not provided."
+            )
             hf_state_dict = self.sd_adapter.to_hf(state_dict)
             hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                 checkpoint_id, from_quantized
@@ -601,14 +601,14 @@ class CheckpointManager:
             from_hf = self.initial_load_in_hf
             from_quantized = self.initial_load_in_hf_quantized
             if from_hf:
-                assert (
-                    model_only
-                ), "Only model can be loaded when loading from HF's safetensors checkpoint."
+                assert model_only, (
+                    "Only model can be loaded when loading from HF's safetensors checkpoint."
+                )
 
             if from_quantized:
-                assert (
-                    from_hf
-                ), "Quantized checkpoint can only be loaded from HuggingFace format."
+                assert from_hf, (
+                    "Quantized checkpoint can only be loaded from HuggingFace format."
+                )
 
             if self.initial_load_path:
                 checkpoint_id = self.initial_load_path
@@ -816,9 +816,9 @@ class CheckpointManager:
             states = self._flattened_model_states_sd()
 
         if self.last_save_in_hf:
-            assert (
-                self.last_save_model_only
-            ), "Only model can be saved when saving in HF safetensors format."
+            assert self.last_save_model_only, (
+                "Only model can be saved when saving in HF safetensors format."
+            )
 
         checkpoint_id = self._create_checkpoint_id(curr_step)
         self.dcp_save(
