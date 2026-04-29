@@ -279,12 +279,16 @@ class Attention(nn.Module):
                     scale=self.scaling,
                 )
             case "sdpa":
-                assert attention_masks is None
+                attn_mask = None
+                if attention_masks is not None:
+                    assert isinstance(attention_masks, torch.Tensor), attention_masks
+                    attn_mask = attention_masks
                 output = (
                     self.inner_attention(
                         xq,  # (bs, n_heads, seqlen, head_dim)
                         xk,  # (bs, n_kv_heads, seqlen, head_dim)
                         xv,  # (bs, n_kv_heads, seqlen, head_dim)
+                        attn_mask=attn_mask,
                         scale=self.scaling,
                         enable_gqa=self.enable_gqa,
                     )
