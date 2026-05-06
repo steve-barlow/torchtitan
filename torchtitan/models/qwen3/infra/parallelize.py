@@ -17,6 +17,7 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
     PrepareModuleInput,
+    PrepareModuleInputOutput,
     RowwiseParallel,
     SequenceParallel,
 )
@@ -277,6 +278,14 @@ def apply_non_moe_tp(
             "attention.wv": colwise_parallel(use_local_output=False),
             "attention.q_norm": SequenceParallel(sequence_dim=2),
             "attention.k_norm": SequenceParallel(sequence_dim=2),
+            "attention.inner_attention": PrepareModuleInputOutput(
+                input_layouts=(Shard(1), Shard(1), Shard(1)),
+                desired_input_layouts=(Shard(1), Shard(1), Shard(1)),
+                use_local_input=True,
+                output_layouts=(Shard(1),),
+                desired_output_layouts=(Shard(1),),
+                use_local_output=False,
+            ),
             "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
             "ffn_norm": SequenceParallel(),
         }
