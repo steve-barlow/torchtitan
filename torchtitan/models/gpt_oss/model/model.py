@@ -8,6 +8,7 @@ import math
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.nn.attention.flex_attention import and_masks, BlockMask
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.models.attention import (
@@ -107,7 +108,32 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def reshape_for_broadcast(rope_cache: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def _maybe_wrap_positions(
+    positions: torch.Tensor | None,
+    x: torch.Tensor,
+) -> torch.Tensor | None:
+    if (
+        positions is not None
+        and isinstance(x, DTensor)
+        and not isinstance(positions, DTensor)
+    ):
+        ndim = positions.ndim
+        placements = tuple(
+            p if not isinstance(p, Shard) or p.dim < ndim else Replicate()
+            for p in x.placements
+        )
+        positions = DTensor.from_local(
+            positions,
+            x.device_mesh,
+            placements,
+            run_check=False,
+        )
+    return positions
+
+
+def reshape_for_broadcast(
+    rope_cache: torch.Tensor, x: torch.Tensor, positions: torch.Tensor | None = None
+) -> torch.Tensor:
     """
     Reshape frequency tensor (represented by cos, sin) for broadcasting it with another tensor.
 
@@ -120,28 +146,51 @@ def reshape_for_broadcast(rope_cache: torch.Tensor, x: torch.Tensor) -> torch.Te
     Args:
         rope_cache (torch.Tensor): RoPE tensor (cos and sin) to be reshaped.
         x (torch.Tensor): Target tensor for broadcasting compatibility.
+        positions (torch.Tensor | None): Position indices used to access/shuffle RoPE cache.
+            Shape is (1, seqlen) or (bz, seqlen). Defaults to None.
 
     Returns:
         torch.Tensor: Reshaped frequency tensor.
     """
     ndim = x.ndim
     assert ndim > 1
-    _, seqlen, _, head_dim = x.shape
-    rope_cache = rope_cache[0:seqlen]
-    # The shape of rope_cache is (seqlen, head_dim * 2) because we concate cos and sin
-    assert rope_cache.shape == (seqlen, head_dim * 2)
-    shape = [-1, seqlen, 1, head_dim * 2]
-    return rope_cache.view(*shape)
+    bz, seqlen, _, head_dim = x.shape
+    if positions is None:
+        rope_cache = rope_cache[0:seqlen]
+        # The shape of rope_cache is (seqlen, head_dim * 2) because we concate cos and sin
+        assert rope_cache.shape == (seqlen, head_dim * 2)
+        shape = [-1, seqlen, 1, head_dim * 2]
+        return rope_cache.view(*shape)
+    elif positions.size(0) == 1:
+        assert positions.shape == (1, seqlen)
+        rope_cache = rope_cache[positions.squeeze(0)]
+        assert rope_cache.shape == (seqlen, head_dim * 2)
+        shape = [-1, seqlen, 1, head_dim * 2]
+        return rope_cache.view(*shape)
+    else:
+        assert positions.shape == (bz, seqlen)
+        rope_cache_expanded = rope_cache[None, :, None, :].expand(bz, -1, -1, -1)
+        rope_cache = torch.gather(
+            rope_cache_expanded,
+            dim=1,
+            index=positions.view(bz, seqlen, 1, 1).expand(bz, seqlen, 1, head_dim * 2),
+        )
+        assert rope_cache.shape == (bz, seqlen, 1, head_dim * 2)
+        return rope_cache
 
 
 def apply_rotary_emb(
-    xq: torch.Tensor, xk: torch.Tensor, rope_cache: torch.Tensor
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    rope_cache: torch.Tensor,
+    positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # input tensor x has shape [bsz, seq_len, n_heads, head_dim]
+    positions = _maybe_wrap_positions(positions, xq)
     head_dim = xq.shape[-1]
 
     # reshape for broadcast
-    rope_cache = reshape_for_broadcast(rope_cache, xq)
+    rope_cache = reshape_for_broadcast(rope_cache, xq, positions)
 
     # [bsz, seq_len, 1, head_dim]
     cos = rope_cache[..., :head_dim].to(dtype=xq.dtype, device=xq.device)
@@ -216,6 +265,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         rope_cache: torch.Tensor,
         attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
@@ -223,6 +273,7 @@ class Attention(nn.Module):
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
             rope_cache (torch.Tensor): Precomputed cosine and sine frequencies for rope embedding.
+            positions (torch.Tensor | None): Position indices used to access/shuffle RoPE cache.
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
@@ -234,7 +285,7 @@ class Attention(nn.Module):
         k = self.wk(x).view(hidden_shape)
         v = self.wv(x).view(hidden_shape)
 
-        q, k = apply_rotary_emb(q, k, rope_cache)
+        q, k = apply_rotary_emb(q, k, rope_cache, positions)
 
         xq = q.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         xk = k.transpose(1, 2)  # (bs, n_kv_heads, seqlen, head_dim)
@@ -313,6 +364,7 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         rope_cache: torch.Tensor,
         attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer block.
@@ -321,11 +373,14 @@ class TransformerBlock(nn.Module):
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
             rope_cache (torch.Tensor): Precomputed cosine and sine frequencies.
             attention_masks (AttentionMasksType | None): a dict of BlockMasks.
+            positions (torch.Tensor | None): Position indices used to access/shuffle RoPE cache.
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        x = x + self.attention(self.attention_norm(x), rope_cache, attention_masks)
+        x = x + self.attention(
+            self.attention_norm(x), rope_cache, attention_masks, positions
+        )
         x = x + self.moe(self.ffn_norm(x))
         return x
 
@@ -449,6 +504,7 @@ class GptOssModel(ModelProtocol):
         self,
         tokens: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
+        positions: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer model.
@@ -456,6 +512,7 @@ class GptOssModel(ModelProtocol):
         Args:
             tokens (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
             attention_masks (AttentionMasksType | None): a dict of BlockMasks.
+            positions (torch.Tensor | None): Position indices used to access/shuffle RoPE cache.
 
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
@@ -463,7 +520,7 @@ class GptOssModel(ModelProtocol):
         h = self.tok_embeddings(tokens)
 
         for layer in self.layers.values():
-            h = layer(h, self.rope_cache, attention_masks)
+            h = layer(h, self.rope_cache, attention_masks, positions)
         h = self.norm(h)
         output = self.output(h)
         return output
