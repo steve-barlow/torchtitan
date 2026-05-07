@@ -17,12 +17,13 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
     PrepareModuleInput,
+    PrepareModuleInputOutput,
     RowwiseParallel,
     SequenceParallel,
 )
 
 from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed import NoParallel, ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.distributed.dual_pipe_v import get_dual_pipe_v_flag
@@ -118,6 +119,7 @@ def parallelize_qwen3(
             enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
             enable_async_tp=job_config.parallelism.enable_async_tensor_parallel,
             cp_enabled=parallel_dims.cp_enabled,
+            enable_sp=getattr(model.model_args, "enable_sequence_parallel", True),
         )
 
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
@@ -209,8 +211,12 @@ def apply_non_moe_tp(
     enable_float8_tensorwise_tp: bool,
     enable_async_tp: bool,
     cp_enabled: bool,
+    enable_sp: bool,
 ):
     """Apply tensor parallelism."""
+    sp_layout = Shard(1) if enable_sp else Replicate()
+    norm_plan = SequenceParallel() if enable_sp else NoParallel()
+
     # 1. Parallelize the embedding and shard its outputs (which are the first
     # transformer block's inputs)
     # 2. Parallelize the root norm layer over the sequence dim
@@ -221,11 +227,11 @@ def apply_non_moe_tp(
         {
             "tok_embeddings": RowwiseParallel(
                 input_layouts=Replicate(),
-                output_layouts=Shard(1),
+                output_layouts=sp_layout,
             ),
-            "norm": SequenceParallel(),
+            "norm": norm_plan,
             "output": ColwiseParallel(
-                input_layouts=Shard(1),
+                input_layouts=sp_layout,
                 output_layouts=Shard(-1) if loss_parallel else Replicate(),
                 use_local_output=not loss_parallel,
             ),
@@ -262,9 +268,9 @@ def apply_non_moe_tp(
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         layer_plan = {
-            "attention_norm": SequenceParallel(),
+            "attention_norm": norm_plan,
             "attention": prepare_module_input(
-                input_layouts=(Shard(1), Replicate(), None, positions_sharding),
+                input_layouts=(sp_layout, Replicate(), None, positions_sharding),
                 desired_input_layouts=(
                     Replicate(),
                     Replicate(),
@@ -275,10 +281,24 @@ def apply_non_moe_tp(
             "attention.wq": colwise_parallel(use_local_output=False),
             "attention.wk": colwise_parallel(use_local_output=False),
             "attention.wv": colwise_parallel(use_local_output=False),
-            "attention.q_norm": SequenceParallel(sequence_dim=2),
-            "attention.k_norm": SequenceParallel(sequence_dim=2),
-            "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
-            "ffn_norm": SequenceParallel(),
+            "attention.q_norm": SequenceParallel(
+                sequence_dim=2,
+                use_local_output=False,
+            ),
+            "attention.k_norm": SequenceParallel(
+                sequence_dim=2,
+                use_local_output=False,
+            ),
+            "attention.inner_attention": PrepareModuleInputOutput(
+                input_layouts=(Shard(1), Shard(1), Shard(1)),
+                desired_input_layouts=(Shard(1), Shard(1), Shard(1)),
+                use_local_input=True,
+                output_layouts=(Shard(1),),
+                desired_output_layouts=(Shard(1),),
+                use_local_output=False,
+            ),
+            "attention.wo": rowwise_parallel(output_layouts=sp_layout),
+            "ffn_norm": norm_plan,
         }
 
         # pyrefly: ignore [missing-attribute]
@@ -286,11 +306,11 @@ def apply_non_moe_tp(
             layer_plan.update(
                 {
                     "feed_forward": prepare_module_input(
-                        input_layouts=(Shard(1),),
+                        input_layouts=(sp_layout,),
                         desired_input_layouts=(Replicate(),),
                     ),
                     "feed_forward.w1": colwise_parallel(),
-                    "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
+                    "feed_forward.w2": rowwise_parallel(output_layouts=sp_layout),
                     "feed_forward.w3": colwise_parallel(),
                 }
             )

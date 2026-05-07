@@ -11,6 +11,7 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.nn.attention.flex_attention import and_masks, BlockMask
 
 from torchtitan.components.tokenizer import BaseTokenizer
@@ -57,6 +58,29 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+def _maybe_wrap_positions(
+    positions: torch.Tensor | None,
+    x: torch.Tensor,
+) -> torch.Tensor | None:
+    if (
+        positions is not None
+        and isinstance(x, DTensor)
+        and not isinstance(positions, DTensor)
+    ):
+        ndim = positions.ndim
+        placements = tuple(
+            p if not isinstance(p, Shard) or p.dim < ndim else Replicate()
+            for p in x.placements
+        )
+        positions = DTensor.from_local(
+            positions,
+            x.device_mesh,
+            placements,
+            run_check=False,
+        )
+    return positions
 
 
 def reshape_for_broadcast(
@@ -116,6 +140,7 @@ def apply_rotary_emb(
     positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # input tensor x has shape [bsz, seq_len, num_heads, head_dim]
+    positions = _maybe_wrap_positions(positions, xq)
     head_dim = xq.shape[-1]
 
     rope_cache = reshape_for_broadcast(rope_cache, xq, positions)
