@@ -8,7 +8,7 @@ import math
 
 import torch
 from torch import nn
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.nn.attention.flex_attention import and_masks, BlockMask
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.models.attention import (
@@ -117,7 +117,11 @@ def _maybe_wrap_positions(
         and isinstance(x, DTensor)
         and not isinstance(positions, DTensor)
     ):
-        placements = tuple(Replicate() for _ in x.placements)
+        ndim = positions.ndim
+        placements = tuple(
+            p if not isinstance(p, Shard) or p.dim < ndim else Replicate()
+            for p in x.placements
+        )
         positions = DTensor.from_local(
             positions,
             x.device_mesh,
