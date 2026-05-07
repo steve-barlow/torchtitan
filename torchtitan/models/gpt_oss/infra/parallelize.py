@@ -104,6 +104,7 @@ def parallelize_gptoss(
             loss_parallel=not job_config.parallelism.disable_loss_parallel,
             enable_float8_tensorwise_tp=False,
             enable_async_tp=False,
+            enable_sp=getattr(model.model_args, "enable_sequence_parallel", True),
         )
 
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
@@ -115,6 +116,7 @@ def parallelize_gptoss(
             ep_mesh=parallel_dims.get_optional_mesh("ep"),
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
             etp_enabled=parallel_dims.etp_enabled,
+            enable_sp=getattr(model.model_args, "enable_sequence_parallel", True),
             dual_pipe_v=dual_pipe_v,
         )
 
@@ -184,8 +186,12 @@ def apply_non_moe_tp(
     loss_parallel: bool,
     enable_float8_tensorwise_tp: bool,
     enable_async_tp: bool,
+    enable_sp: bool,
 ):
     """Apply tensor parallelism."""
+    sp_layout = Shard(1) if enable_sp else Replicate()
+    norm_plan = SequenceParallel() if enable_sp else NoParallel()
+
     # 1. Parallelize the embedding and shard its outputs (which are the first
     # transformer block's inputs)
     # 2. Parallelize the root norm layer over the sequence dim
@@ -196,11 +202,11 @@ def apply_non_moe_tp(
         {
             "tok_embeddings": RowwiseParallel(
                 input_layouts=Replicate(),
-                output_layouts=Shard(1),
+                output_layouts=sp_layout,
             ),
-            "norm": SequenceParallel(),
+            "norm": norm_plan,
             "output": ColwiseParallel(
-                input_layouts=Shard(1),
+                input_layouts=sp_layout,
                 output_layouts=Shard(-1) if loss_parallel else Replicate(),
                 use_local_output=not loss_parallel,
             ),
@@ -211,9 +217,9 @@ def apply_non_moe_tp(
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         layer_plan = {
-            "attention_norm": SequenceParallel(),
+            "attention_norm": norm_plan,
             "attention": PrepareModuleInput(
-                input_layouts=(Shard(1), Replicate(), None, None),
+                input_layouts=(sp_layout, Replicate(), None, None),
                 desired_input_layouts=(Replicate(), Replicate(), None, None),
             ),
             "attention.wq": ColwiseParallel(use_local_output=False),
@@ -227,8 +233,8 @@ def apply_non_moe_tp(
                 desired_output_layouts=(Shard(1), Shard(1)),
                 use_local_output=False,
             ),
-            "attention.wo": RowwiseParallel(output_layouts=Shard(1)),
-            "ffn_norm": SequenceParallel(),
+            "attention.wo": RowwiseParallel(output_layouts=sp_layout),
+            "ffn_norm": norm_plan,
         }
 
         # shard attention.sinks across heads
@@ -262,9 +268,11 @@ def apply_moe_ep_tp(
     ep_mesh: DeviceMesh | None,
     ep_etp_mesh: DeviceMesh | None,
     etp_enabled: bool,
+    enable_sp: bool,
     dual_pipe_v: bool = False,
 ):
     assert ep_mesh is not None or tp_mesh is not None
+    sp_layout = Shard(1) if enable_sp else Replicate()
 
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
@@ -277,11 +285,11 @@ def apply_moe_ep_tp(
                 # input / output sharding on the seqlen dim
                 # all-gather for input, reduce-scatter for output
                 "moe": PrepareModuleInputOutput(
-                    input_layouts=(Shard(1),),
+                    input_layouts=(sp_layout,),
                     desired_input_layouts=(Replicate(),),
                     use_local_input=True,
                     output_layouts=(Partial(),),
-                    desired_output_layouts=(Shard(1),),
+                    desired_output_layouts=(sp_layout,),
                 ),
                 # replicate computation for the router
                 "moe.router.gate": NoParallel(),
