@@ -296,12 +296,18 @@ class Attention(nn.Module):
                 )  # (bs, seqlen, n_local_heads, head_dim)
             case "varlen":
                 assert isinstance(attention_masks, VarlenMetadata), attention_masks
+                # q/k RMSNorm runs in fp32, while varlen FlashAttention requires fp16/bf16.
+                xq = xq.to(dtype=xv.dtype)
+                xk = xk.to(dtype=xv.dtype)
                 output = self.inner_attention(
                     xq,  # (bs, n_heads, seqlen, head_dim)
                     xk,  # (bs, n_kv_heads, seqlen, head_dim)
                     xv,  # (bs, n_kv_heads, seqlen, head_dim)
-                    attention_masks,
+                    # Keep varlen metadata out of positional args so TP input
+                    # layout hooks only rewrite the sharded q/k/v tensors.
+                    attention_masks=attention_masks,
                     scale=self.scaling,
+                    enable_gqa=self.enable_gqa,
                 )
             case "sdpa":
                 assert attention_masks is None

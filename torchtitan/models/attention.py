@@ -68,6 +68,7 @@ class VarlenAttentionWrapper(torch.nn.Module):
         xv: torch.Tensor,
         attention_masks: VarlenMetadata,
         scale: float | None = None,
+        enable_gqa: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self._compiled_varlen_attn is None:
             raise RuntimeError(
@@ -80,6 +81,8 @@ class VarlenAttentionWrapper(torch.nn.Module):
         max_q = attention_masks.max_q
         max_k = attention_masks.max_k
 
+        output_dtype = xq.dtype
+        batch_size, _, seq_len, head_dim = xq.shape
         xq_packed = xq.transpose(1, 2).flatten(0, 1)  # (bs * seqlen, n_heads, head_dim)
         xk_packed = xk.transpose(1, 2).flatten(
             0, 1
@@ -88,7 +91,12 @@ class VarlenAttentionWrapper(torch.nn.Module):
             0, 1
         )  # (bs * seqlen, n_kv_heads, head_dim)
 
-        return VarlenAttentionWrapper._compiled_varlen_attn(
+        # PyTorch varlen attention is FlashAttention-backed and only accepts fp16/bf16.
+        xq_packed = xq_packed.to(torch.bfloat16)
+        xk_packed = xk_packed.to(torch.bfloat16)
+        xv_packed = xv_packed.to(torch.bfloat16)
+
+        out_packed = VarlenAttentionWrapper._compiled_varlen_attn(
             xq_packed,
             xk_packed,
             xv_packed,
@@ -108,7 +116,9 @@ class VarlenAttentionWrapper(torch.nn.Module):
             #               is_causal=False.
             #   - (W, 0): Sliding window causal - attend to at most W previous tokens.
             window_size=(-1, 0),
+            enable_gqa=enable_gqa,
         )
+        return out_packed.view(batch_size, seq_len, -1, head_dim).to(output_dtype)
 
 
 class FlexAttentionWrapper(torch.nn.Module):

@@ -120,6 +120,7 @@ def parallelize_qwen3(
             enable_async_tp=job_config.parallelism.enable_async_tensor_parallel,
             cp_enabled=parallel_dims.cp_enabled,
             enable_sp=getattr(model.model_args, "enable_sequence_parallel", True),
+            attn_type=attn_type,
         )
 
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
@@ -212,6 +213,7 @@ def apply_non_moe_tp(
     enable_async_tp: bool,
     cp_enabled: bool,
     enable_sp: bool,
+    attn_type: str,
 ):
     """Apply tensor parallelism."""
     sp_layout = Shard(1) if enable_sp else Replicate()
@@ -265,6 +267,11 @@ def apply_non_moe_tp(
     #       by folding (and unfolding) the batch dimension and the sequence dimension.
     #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
     positions_sharding = Replicate() if cp_enabled else None
+    # Flex/SDPA return attention as [batch, heads, seq, dim] before the model
+    # transposes it; varlen returns [batch, seq, heads, dim] directly. In both
+    # cases TP shards the local heads dimension, so the output layout dimension
+    # differs by backend.
+    inner_attention_output_layout = Shard(2) if attn_type == "varlen" else Shard(1)
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         layer_plan = {
@@ -293,8 +300,8 @@ def apply_non_moe_tp(
                 input_layouts=(Shard(1), Shard(1), Shard(1)),
                 desired_input_layouts=(Shard(1), Shard(1), Shard(1)),
                 use_local_input=True,
-                output_layouts=(Shard(1),),
-                desired_output_layouts=(Shard(1),),
+                output_layouts=(inner_attention_output_layout,),
+                desired_output_layouts=(inner_attention_output_layout,),
                 use_local_output=False,
             ),
             "attention.wo": rowwise_parallel(output_layouts=sp_layout),
