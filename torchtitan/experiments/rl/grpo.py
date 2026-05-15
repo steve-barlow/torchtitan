@@ -421,7 +421,6 @@ def _full_completion_record(
         "policy_version": completion.policy_version,
         "problem_id": metadata.get("problem_id"),
         "target": metadata.get("target"),
-        "question": metadata.get("question"),
         "rewards": step.rewards,
         "compilation_passed": metadata.get("compilation_passed"),
         "func_passed": metadata.get("func_passed"),
@@ -434,6 +433,7 @@ def _full_completion_record(
         "completion_token_count": len(completion.token_ids),
         "sequence_token_count": len(completion.prompt_token_ids)
         + len(completion.token_ids),
+        "question": metadata.get("question"),
         "final_text": metadata.get("final_text"),
         "extracted_code": metadata.get("extracted_code"),
         "coding_failure_reason": metadata.get("coding_failure_reason"),
