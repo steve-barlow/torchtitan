@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -21,11 +22,15 @@ class Step:
 
     ``observation`` (the next prompt the agent will see) is only
     populated by multi-turn envs. Single-turn envs leave it None.
+
+    ``metadata`` carries optional logging/debug details for trainers. It is
+    deliberately ignored by reward math so existing envs remain compatible.
     """
 
     rewards: dict[str, float]
     done: bool
     observation: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def reward(self) -> float:

@@ -22,6 +22,8 @@ python3 torchtitan/experiments/rl/grpo.py \
 """
 
 import asyncio
+import inspect
+import json
 import logging
 import math
 import os
@@ -55,6 +57,35 @@ from torchtitan.experiments.rl.types import (
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
+
+
+async def run_env_step(env: object, completion: str) -> Step:
+    """Run a sync or async env.step and return a Step."""
+    result = env.step(completion)
+    # Veribench step is async because it calls CodingReward, which runs the evaluator/simulator asynchronously.
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, Step):
+        raise TypeError(f"env.step returned {type(result)!r}, expected type was Step")
+    return result
+
+
+async def run_env_steps(
+    envs: list[object],
+    completions: list[Completion],
+    *,
+    concurrency: int,
+) -> list[tuple[Completion, Step]]:
+    """Score completions with bounded env-step concurrency. 
+    Concurrency controls how many verilog simulator jobs can run at once."""
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def run_one(completion: Completion) -> tuple[Completion, Step]:
+        async with semaphore:
+            env = envs[completion.prompt_idx]
+            return completion, await run_env_step(env, completion.text)
+
+    return await asyncio.gather(*(run_one(completion) for completion in completions))
 
 
 class GRPOLoss(Configurable):
@@ -138,7 +169,13 @@ class Provisioner:
 
 def _mean_rewards(steps: list[Step]) -> dict[str, float]:
     """Per-component mean reward across a list of Steps."""
-    return {k: sum(s.rewards[k] for s in steps) / len(steps) for k in steps[0].rewards}
+    if not steps:
+        return {}
+    keys = sorted({key for step in steps for key in step.rewards})
+    return {
+        key: sum(step.rewards.get(key, 0.0) for step in steps) / len(steps)
+        for key in keys
+    }
 
 
 def _format_rewards(components: dict[str, float]) -> str:
@@ -152,16 +189,337 @@ def _format_validation(result: dict) -> str:
     )
 
 
-def _log_samples(items: list[Episode] | list[Completion]) -> None:
-    """Log the first sample per prompt for debugging."""
+def _sample_first_per_prompt(
+    items: list[Episode] | list[Completion],
+) -> list[Episode] | list[Completion]:
+    """Return the same first-per-prompt samples shown by ``_log_samples``."""
     seen_prompts: set[int] = set()
+    sampled = []
     for item in items:
         if item.prompt_idx in seen_prompts:
             continue
         seen_prompts.add(item.prompt_idx)
+        sampled.append(item)
+    return sampled
+
+
+def _log_samples(items: list[Episode] | list[Completion]) -> None:
+    """Log the first sample per prompt for debugging."""
+    for item in _sample_first_per_prompt(items):
         reward_str = f" reward={item.reward:+.1f}" if hasattr(item, "reward") else ""
         logger.info(f"  [prompt {item.prompt_idx}]{reward_str}")
         logger.info(f"       A: {item.text[:300].replace(chr(10), ' ').strip()}")
+
+
+def _preview_text(value: object, *, max_chars: int = 300) -> str:
+    if value is None:
+        return ""
+    return str(value)[:max_chars].replace(chr(10), " ").strip()
+
+
+def _step_metadata(step: Step) -> dict[str, object]:
+    return step.metadata or {}
+
+
+def _log_validation_samples(
+    envs: list[object],
+    completion_steps: list[tuple[Completion, Step]],
+    *,
+    max_samples: int = 2,
+) -> None:
+    """Log validation samples with optional env/reward metadata."""
+    for completion, step in completion_steps[:max_samples]:
+        env = envs[completion.prompt_idx]
+        metadata = _step_metadata(step)
+        logger.info(
+            "  [validation prompt %s] problem_id=%s target=%s rewards=%s "
+            "compilation_passed=%s func_passed=%s",
+            completion.prompt_idx,
+            metadata.get("problem_id", getattr(env, "problem_id", None)),
+            metadata.get("target", getattr(env, "target", None)),
+            step.rewards,
+            metadata.get("compilation_passed"),
+            metadata.get("func_passed"),
+        )
+        logger.info(
+            "       question: %s",
+            _preview_text(
+                metadata.get("question", getattr(env, "question", None))
+            ),
+        )
+        logger.info("       completion: %s", _preview_text(completion.text))
+        logger.info(
+            "       final_text: %s",
+            _preview_text(
+                metadata.get("final_text", getattr(env, "final_text", None))
+            ),
+        )
+
+
+def _append_jsonl_record(path: str | None, record: dict[str, object]) -> None:
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _log_training_step_diagnostics(
+    step_idx: int,
+    trajectories: list[Trajectory],
+    *,
+    num_prompts: int,
+    completions_per_prompt: int,
+    max_response_tokens: int | None = None,
+    final_text_stats_path: str | None = None,
+) -> None:
+    steps = [trajectory.transitions[0][1] for trajectory in trajectories]
+    rewards = [step.reward for step in steps]
+    reward_mean = sum(rewards) / len(rewards) if rewards else 0.0
+    reward_min = min(rewards) if rewards else 0.0
+    reward_max = max(rewards) if rewards else 0.0
+    metadata = [_step_metadata(step) for step in steps]
+    compilation_passed = sum(item.get("compilation_passed") is True for item in metadata)
+    func_passed = sum(item.get("func_passed") is True for item in metadata)
+    format_failed = sum(item.get("format_passed") is False for item in metadata)
+
+    grouped_rewards: dict[int, list[float]] = {}
+    for trajectory, reward in zip(trajectories, rewards):
+        grouped_rewards.setdefault(trajectory.sample_idx, []).append(reward)
+    zero_variance_groups = sum(
+        len(group) > 1 and max(group) == min(group)
+        for group in grouped_rewards.values()
+    )
+
+    total_completions = len(trajectories)
+    format_passed = total_completions - format_failed
+    format_passed_rate = (
+        format_passed / total_completions if total_completions else 0.0
+    )
+    completions = [trajectory.transitions[0][0] for trajectory in trajectories]
+    response_lengths = [len(completion.token_ids) for completion in completions]
+    prompt_lengths = [len(completion.prompt_token_ids) for completion in completions]
+    sequence_lengths = [
+        prompt_len + response_len
+        for prompt_len, response_len in zip(prompt_lengths, response_lengths)
+    ]
+    prompt_length_min = min(prompt_lengths) if prompt_lengths else 0
+    prompt_length_max = max(prompt_lengths) if prompt_lengths else 0
+    prompt_length_mean = (
+        sum(prompt_lengths) / total_completions if total_completions else 0.0
+    )
+    sequence_length_min = min(sequence_lengths) if sequence_lengths else 0
+    sequence_length_max = max(sequence_lengths) if sequence_lengths else 0
+    sequence_length_mean = (
+        sum(sequence_lengths) / total_completions if total_completions else 0.0
+    )
+    response_length_min = min(response_lengths) if response_lengths else 0
+    response_length_max = max(response_lengths) if response_lengths else 0
+    response_length_mean = (
+        sum(response_lengths) / total_completions if total_completions else 0.0
+    )
+    format_failed_flags = [
+        item.get("format_passed") is False for item in metadata
+    ]
+    max_length_completions = (
+        sum(
+            is_format_failed and length >= max_response_tokens
+            for is_format_failed, length in zip(format_failed_flags, response_lengths)
+        )
+        if max_response_tokens is not None
+        else 0
+    )
+
+    logger.info(
+        "Step %2d diagnostics | rollouts=%d prompts=%d completions_per_prompt=%d "
+        "reward: mean=%+.3f min=%+.3f max=%+.3f | compilation_passed=%d "
+        "func_passed=%d format_failed=%d max_length_completions=%d "
+        "zero_variance_groups=%d",
+        step_idx,
+        total_completions,
+        num_prompts,
+        completions_per_prompt,
+        reward_mean,
+        reward_min,
+        reward_max,
+        compilation_passed,
+        func_passed,
+        format_failed,
+        max_length_completions,
+        zero_variance_groups,
+    )
+    _append_jsonl_record(
+        final_text_stats_path,
+        {
+            "split": "train",
+            "step": step_idx,
+            "total_completions": total_completions,
+            "format_passed": format_passed,
+            "format_failed": format_failed,
+            "max_length_completions": max_length_completions,
+            "format_passed_rate": format_passed_rate,
+            "format_failed_rate": 1.0 - format_passed_rate,
+            "num_prompts": num_prompts,
+            "completions_per_prompt": completions_per_prompt,
+            "prompt_length_min": prompt_length_min,
+            "prompt_length_mean": prompt_length_mean,
+            "prompt_length_max": prompt_length_max,
+            "sequence_length_min": sequence_length_min,
+            "sequence_length_mean": sequence_length_mean,
+            "sequence_length_max": sequence_length_max,
+            "response_length_min": response_length_min,
+            "response_length_mean": response_length_mean,
+            "response_length_max": response_length_max,
+            "max_length_completion_rate": (
+                max_length_completions / total_completions
+                if total_completions
+                else 0.0
+            ),
+            "compilation_passed": compilation_passed,
+            "func_passed": func_passed,
+            "reward_mean": reward_mean,
+            "reward_min": reward_min,
+            "reward_max": reward_max,
+        },
+    )
+
+def _log_train_batch_stats(step_idx: int, batches: list[TrainBatch]) -> None:
+    summaries: list[str] = []
+    for rank, batch in enumerate(batches):
+        episode_count = len(batch.seq_lens)
+        total_tokens = int(batch.token_ids.numel())
+        prompt_total = sum(batch.prompt_lens)
+        response_total = sum(batch.response_lens)
+        max_seq_len = max(batch.seq_lens) if batch.seq_lens else 0
+        min_seq_len = min(batch.seq_lens) if batch.seq_lens else 0
+        max_prompt_len = max(batch.prompt_lens) if batch.prompt_lens else 0
+        max_response_len = max(batch.response_lens) if batch.response_lens else 0
+        mean_seq_len = sum(batch.seq_lens) / episode_count if episode_count else 0.0
+        mean_response_len = response_total / episode_count if episode_count else 0.0
+        summaries.append(
+            f"rank={rank} episodes={episode_count} total_tokens={total_tokens} "
+            f"seq[min/mean/max]={min_seq_len}/{mean_seq_len:.1f}/{max_seq_len} "
+            f"prompt_total={prompt_total} response_total={response_total} "
+            f"response_mean={mean_response_len:.1f} max_prompt={max_prompt_len} "
+            f"max_response={max_response_len}"
+        )
+    logger.info("Step %2d train batch stats | %s", step_idx, " | ".join(summaries))
+
+
+def _full_completion_record(
+    *,
+    split: str,
+    step_idx: int | None,
+    completion: Completion,
+    step: Step,
+) -> dict[str, object]:
+    metadata = _step_metadata(step)
+    return {
+        "split": split,
+        "step": step_idx,
+        "prompt_idx": completion.prompt_idx,
+        "policy_version": completion.policy_version,
+        "problem_id": metadata.get("problem_id"),
+        "target": metadata.get("target"),
+        "question": metadata.get("question"),
+        "rewards": step.rewards,
+        "compilation_passed": metadata.get("compilation_passed"),
+        "func_passed": metadata.get("func_passed"),
+        "format_passed": metadata.get("format_passed"),
+        "format_failed": metadata.get("format_passed") is False,
+        "format_reward": metadata.get("format_reward"),
+        "format_failure_reason": metadata.get("format_failure_reason"),
+        "empty_response": metadata.get("empty_response"),
+        "prompt_token_count": len(completion.prompt_token_ids),
+        "completion_token_count": len(completion.token_ids),
+        "sequence_token_count": len(completion.prompt_token_ids)
+        + len(completion.token_ids),
+        "final_text": metadata.get("final_text"),
+        "extracted_code": metadata.get("extracted_code"),
+        "coding_failure_reason": metadata.get("coding_failure_reason"),
+        "coding_reward_log": metadata.get("coding_reward_log"),
+        "completion_text": completion.text,
+    }
+
+
+def _append_full_completion_records(
+    path: str | None,
+    records: list[dict[str, object]],
+) -> None:
+    if not path or not records:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _sampled_training_completion_records(
+    trajectories: list[Trajectory],
+    *,
+    step_idx: int,
+) -> list[dict[str, object]]:
+    seen_prompts: set[int] = set()
+    records = []
+    for trajectory in trajectories:
+        if trajectory.sample_idx in seen_prompts:
+            continue
+        seen_prompts.add(trajectory.sample_idx)
+        completion, step = trajectory.transitions[0]
+        records.append(
+            _full_completion_record(
+                split="train",
+                step_idx=step_idx,
+                completion=completion,
+                step=step,
+            )
+        )
+    return records
+
+
+def _sampled_validation_completion_records(
+    completion_steps: list[tuple[Completion, Step]],
+    *,
+    max_samples: int = 2,
+) -> list[dict[str, object]]:
+    return [
+        _full_completion_record(
+            split="validation",
+            step_idx=None,
+            completion=completion,
+            step=step,
+        )
+        for completion, step in completion_steps[:max_samples]
+    ]
+
+
+def _log_training_completion_samples(
+    step_idx: int,
+    trajectories: list[Trajectory],
+    *,
+    max_samples: int = 2,
+) -> None:
+    for trajectory in trajectories[:max_samples]:
+        completion, step = trajectory.transitions[0]
+        metadata = _step_metadata(step)
+        logger.info(
+            "  [train step %s prompt %s] problem_id=%s target=%s rewards=%s "
+            "compilation_passed=%s func_passed=%s",
+            step_idx,
+            trajectory.sample_idx,
+            metadata.get("problem_id"),
+            metadata.get("target"),
+            step.rewards,
+            metadata.get("compilation_passed"),
+            metadata.get("func_passed"),
+        )
+        logger.info(
+            "       question: %s", _preview_text(metadata.get("question"))
+        )
+        logger.info("       completion: %s", _preview_text(completion.text))
+        logger.info(
+            "       final_text: %s", _preview_text(metadata.get("final_text"))
+        )
 
 
 class RLTrainer(Configurable):
@@ -203,6 +561,9 @@ class RLTrainer(Configurable):
         log_samples: bool = False
         """Log first completion per episode during training and validation."""
 
+        env_step_concurrency: int = 4
+        """Maximum number of env.step calls to run concurrently."""
+
         compile: CompileConfig = field(default_factory=CompileConfig)
         """torch.compile config shared by trainer and generator."""
 
@@ -242,6 +603,25 @@ class RLTrainer(Configurable):
         self.trainer = None
         self.generator = None
         self._proc_meshes = []
+        output_dir = os.environ.get("TORCHTITAN_RL_OUTPUT_DIR") or config.dump_folder
+        config.dump_folder = output_dir
+        self.full_completion_log_path = os.path.join(
+            output_dir,
+            "full_sample_completions.jsonl",
+        )
+        self.final_text_stats_log_path = os.path.join(
+            output_dir,
+            "final_text_completion_stats.jsonl",
+        )
+        if config.log_samples:
+            logger.info(
+                "Full --log_samples completions will be written to %s",
+                self.full_completion_log_path,
+            )
+        logger.info(
+            "Per-step final-text completion stats will be written to %s",
+            self.final_text_stats_log_path,
+        )
 
     async def close(self):
         """Best-effort: tear down actors, then stop proc meshes."""
@@ -469,7 +849,7 @@ class RLTrainer(Configurable):
         # pull weights for policy version 0 (initial weights)
         self.generator.pull_model_state_dict.call(0).get()
 
-    def _collect_rollouts(self, num_groups: int, step: int) -> list[Trajectory]:
+    async def _collect_rollouts(self, num_groups: int, step: int) -> list[Trajectory]:
         """Collect group rollouts: one single-use env per group, scored and returned."""
         envs = [
             self.config.env.build(step=step, group_idx=i) for i in range(num_groups)
@@ -477,13 +857,15 @@ class RLTrainer(Configurable):
         completions = self._get_rank_0_value(
             self.generator.generate.call([env.prompt for env in envs]).get()
         )
-        trajectories: list[Trajectory] = []
-        for c in completions:
-            step_result = envs[c.prompt_idx].step(c.text)
-            trajectories.append(
-                Trajectory(sample_idx=c.prompt_idx, transitions=[(c, step_result)])
-            )
-        return trajectories
+        completion_steps = await run_env_steps(
+            envs,
+            completions,
+            concurrency=self.config.env_step_concurrency,
+        )
+        return [
+            Trajectory(sample_idx=c.prompt_idx, transitions=[(c, step_result)])
+            for c, step_result in completion_steps
+        ]
 
     @staticmethod
     def _build_episodes(trajectories: list[Trajectory]) -> list[Episode]:
@@ -533,10 +915,19 @@ class RLTrainer(Configurable):
             ).get()
         )
 
-        steps = [env.step(completions[i].text) for i, env in enumerate(envs)]
+        completion_steps = await run_env_steps(
+            envs,
+            completions,
+            concurrency=self.config.env_step_concurrency,
+        )
+        steps = [step for _, step in completion_steps]
 
         if self.config.log_samples:
-            _log_samples(completions)
+            _log_validation_samples(envs, completion_steps)
+            _append_full_completion_records(
+                self.full_completion_log_path,
+                _sampled_validation_completion_records(completion_steps),
+            )
 
         components = _mean_rewards(steps)
         return {
@@ -562,17 +953,40 @@ class RLTrainer(Configurable):
             step_start = time.perf_counter()
 
             # --- Collect data and create episodes --- #
-            trajectories = self._collect_rollouts(num_groups, step=step)
+            trajectories = await self._collect_rollouts(num_groups, step=step)
             episodes = self._build_episodes(trajectories)
+            logger.info(
+                "Step %2d collected %d rollouts and built %d episodes",
+                step,
+                len(trajectories),
+                len(episodes),
+            )
+            _log_training_step_diagnostics(
+                step,
+                trajectories,
+                num_prompts=num_groups,
+                completions_per_prompt=self.config.generator.sampling.n,
+                max_response_tokens=self.config.generator.sampling.max_tokens,
+                final_text_stats_path=self.final_text_stats_log_path,
+            )
 
             if self.config.log_samples:
                 _log_samples(episodes)
+                _log_training_completion_samples(step, trajectories)
+                _append_full_completion_records(
+                    self.full_completion_log_path,
+                    _sampled_training_completion_records(
+                        trajectories,
+                        step_idx=step,
+                    ),
+                )
 
             # --- Train step --- #
             batches = [
                 self._collate_episodes(per_rank_episodes)
                 for per_rank_episodes in self._shard_episodes(episodes)
             ]
+            _log_train_batch_stats(step, batches)
             fwd_bwd_metrics = self._get_rank_0_value(
                 self.trainer.forward_backward.call(batches).get()
             )
@@ -620,6 +1034,9 @@ async def main():
         await rl_trainer.train()
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Interrupted; attempting graceful shutdown...")
+    except Exception:
+        logger.exception("RLTrainer failed; attempting graceful shutdown...")
+        raise
     finally:
         await rl_trainer.close()
 

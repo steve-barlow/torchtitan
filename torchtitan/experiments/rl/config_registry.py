@@ -23,6 +23,7 @@ from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGener
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.grpo import GRPOLoss, RLTrainer
 from torchtitan.experiments.rl.sum_digits import SumDigitsEnv
+from torchtitan.experiments.rl.veribench_env import VeribenchEnv
 from torchtitan.models.qwen3 import model_registry
 
 
@@ -67,6 +68,65 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
                 temperature=0.8,
                 top_p=0.95,
                 max_tokens=100,
+            ),
+        ),
+    )
+
+
+
+def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
+    """Multi-step Qwen3-0.6B GRPO run for Veribench + CodingReward."""
+    model_spec = model_registry("0.6B", attn_backend="varlen")
+    model_spec.model.rope.max_seq_len = 5120
+    return RLTrainer.Config(
+        model_spec=model_spec,
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
+        num_steps=5,
+        num_prompts_per_step=6,
+        num_validation_samples=8,
+        env_step_concurrency=4,
+        log_samples=True,
+        compile=CompileConfig(enable=True, backend="aot_eager"),
+        env=VeribenchEnv.Config(
+            split="train",
+            seed=42,
+            enable_thinking=True,
+            compilation_credit=0.1,
+        ),
+        validation_env=VeribenchEnv.Config(
+            split="validation",
+            seed=99,
+            enable_thinking=True,
+            compilation_credit=0.1,
+        ),
+        trainer=PolicyTrainer.Config(
+            optimizer=OptimizersContainer.Config(lr=2e-6),
+            lr_scheduler=LRSchedulersContainer.Config(
+                warmup_steps=2,
+                decay_type="linear",
+            ),
+            training=TrainingConfig(seq_len=5120),
+            parallelism=ParallelismConfig(
+                data_parallel_shard_degree=6,
+                tensor_parallel_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
+            ),
+            loss=GRPOLoss.Config(),
+        ),
+        generator=VLLMGenerator.Config(
+            model_dtype="bfloat16",
+            parallelism=ParallelismConfig(
+                tensor_parallel_degree=2,
+                data_parallel_replicate_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
+            ),
+            sampling=SamplingConfig(
+                n=4,
+                temperature=1,
+                top_p=0.95,
+                max_tokens=4096,
             ),
         ),
     )
