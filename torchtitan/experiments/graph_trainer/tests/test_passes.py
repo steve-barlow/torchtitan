@@ -31,13 +31,10 @@ from torchtitan.experiments.graph_trainer.cudagraph import (
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import overlap_fsdp_ag_rs_pass
 from torchtitan.experiments.graph_trainer.graph_utils import export_joint
-from torchtitan.experiments.graph_trainer.make_fx_tracer import (
-    minimal_fx_tracer,
-    trace_train_step,
-)
+from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
 from torchtitan.experiments.graph_trainer.memory_policy import (
     _make_default_memory_policy,
-    apply_sac_pass,
+    tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.passes import (
     remove_detach_pass,
@@ -193,6 +190,62 @@ class TestOverlapFsdpAgRsPass(FSDPTest):
 
         self.assertEqual(total_before, total_after)
 
+    def test_overlap_rewrites_multiple_pgs(self):
+        """When the graph has AG nodes from multiple FSDP PGs (e.g. FSDP +
+        expert-FSDP), each source PG should be mapped to its own extra PG."""
+        import torch.distributed as dist
+
+        from torchtitan.experiments.graph_trainer.fsdp_passes import (
+            _EXTRA_FSDP_PG_REGISTRY,
+        )
+
+        self._setup()
+        model = self._make_fsdp_model()
+        inputs = torch.randn(4, 16).cuda()
+        fsdp_pg_name = self._get_fsdp_pg_name()
+
+        bw_gm, bw_example_inputs = self._export_and_get_bw_graph(model, inputs)
+
+        # Create a second PG to simulate expert-FSDP
+        second_pg = dist.new_group(
+            ranks=list(range(self.world_size)),
+            use_local_synchronization=True,
+        )
+        second_pg_name = second_pg.group_name
+
+        # Rewrite half the AG nodes to use the second PG
+        ag_nodes = [n for n in bw_gm.graph.nodes if is_all_gather(n)]
+        self.assertGreater(len(ag_nodes), 1)
+        half = len(ag_nodes) // 2
+        for node in ag_nodes[:half]:
+            node.args = (node.args[0], node.args[1], second_pg_name)
+
+        ag_pg1_before = self._count_ag_nodes_with_pg(bw_gm, fsdp_pg_name)
+        ag_pg2_before = self._count_ag_nodes_with_pg(bw_gm, second_pg_name)
+        self.assertGreater(ag_pg1_before, 0)
+        self.assertGreater(ag_pg2_before, 0)
+
+        _EXTRA_FSDP_PG_REGISTRY.pop(fsdp_pg_name, None)
+        _EXTRA_FSDP_PG_REGISTRY.pop(second_pg_name, None)
+        overlap_fsdp_ag_rs_pass(bw_gm, bw_example_inputs)
+
+        # Both source PGs should have their own extra PG
+        self.assertIn(fsdp_pg_name, _EXTRA_FSDP_PG_REGISTRY)
+        self.assertIn(second_pg_name, _EXTRA_FSDP_PG_REGISTRY)
+        extra_pg1 = _EXTRA_FSDP_PG_REGISTRY[fsdp_pg_name]
+        extra_pg2 = _EXTRA_FSDP_PG_REGISTRY[second_pg_name]
+        self.assertNotEqual(
+            extra_pg1, extra_pg2, "Each source PG must map to a distinct extra PG"
+        )
+
+        # No AG nodes should still use original PGs
+        self.assertEqual(self._count_ag_nodes_with_pg(bw_gm, fsdp_pg_name), 0)
+        self.assertEqual(self._count_ag_nodes_with_pg(bw_gm, second_pg_name), 0)
+
+        # All AG nodes should use their respective extra PGs
+        self.assertEqual(self._count_ag_nodes_with_pg(bw_gm, extra_pg1), ag_pg1_before)
+        self.assertEqual(self._count_ag_nodes_with_pg(bw_gm, extra_pg2), ag_pg2_before)
+
     def test_overlap_is_noop_when_no_fsdp_ag(self):
         """If the graph has no FSDP all-gathers, the pass is a no-op."""
         self._setup()
@@ -206,7 +259,7 @@ class TestOverlapFsdpAgRsPass(FSDPTest):
 
 
 class TestApplySACPass(TestCase):
-    """Unit tests for the apply_sac_pass joint graph pass."""
+    """Unit tests for the tag_sac_policy joint graph pass."""
 
     def _build_gm(self, op_targets):
         """Build a GraphModule with a chain of call_function nodes.
@@ -246,7 +299,7 @@ class TestApplySACPass(TestCase):
                 torch.ops.aten.relu.default,
             ]
         )
-        apply_sac_pass(gm)
+        tag_sac_policy(gm)
         for node in self._get_call_function_nodes(gm):
             self.assertEqual(node.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
 
@@ -254,7 +307,7 @@ class TestApplySACPass(TestCase):
         """Non-mm ops in the save list should be marked MUST_SAVE."""
         custom_save = {torch.ops.aten.add.Tensor}
         gm = self._build_gm([torch.ops.aten.add.Tensor])
-        apply_sac_pass(gm, policy_fn=_make_default_memory_policy(custom_save))
+        tag_sac_policy(gm, policy_fn=_make_default_memory_policy(custom_save))
         nodes = self._get_call_function_nodes(gm)
         self.assertEqual(len(nodes), 1)
         self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
@@ -274,7 +327,7 @@ class TestApplySACPass(TestCase):
         self.assertEqual(nodes[0].target, torch.ops.aten.add.Tensor)
         self.assertEqual(nodes[2].target, operator.getitem)
 
-        apply_sac_pass(gm)
+        tag_sac_policy(gm)
 
         tuple_node = nodes[1]
         getitem_node = nodes[2]
@@ -292,7 +345,7 @@ class TestApplySACPass(TestCase):
         nodes = self._get_call_function_nodes(gm)
         nodes[0].meta["custom"] = {_MODULE_FQN: "layers.3.attention"}
 
-        apply_sac_pass(gm, policy_fn=_make_default_memory_policy(custom_save))
+        tag_sac_policy(gm, policy_fn=_make_default_memory_policy(custom_save))
 
         rs_node = nodes[0]
         wait_node = nodes[1]
@@ -311,7 +364,7 @@ class TestApplySACPass(TestCase):
         nodes[0].meta["custom"] = {_MODULE_FQN: "layers.0.feed_forward"}
         nodes[1].meta["custom"] = {_MODULE_FQN: "layers.1.attention"}
 
-        apply_sac_pass(gm)
+        tag_sac_policy(gm)
 
         # add is at the boundary (layer 0 -> layer 1), forced to MUST_SAVE
         self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
@@ -326,7 +379,7 @@ class TestApplySACPass(TestCase):
                 torch.ops.aten.relu.default,
             ]
         )
-        apply_sac_pass(gm, policy_fn=_make_default_memory_policy(custom_save))
+        tag_sac_policy(gm, policy_fn=_make_default_memory_policy(custom_save))
         policies = {
             n.target: n.meta["recompute"] for n in self._get_call_function_nodes(gm)
         }
@@ -349,7 +402,7 @@ class TestApplySACPass(TestCase):
                 torch.ops.aten.mm.default,  # in save list -> MUST_SAVE
             ]
         )
-        apply_sac_pass(gm, policy_fn=_make_default_memory_policy(custom_save))
+        tag_sac_policy(gm, policy_fn=_make_default_memory_policy(custom_save))
         nodes = self._get_call_function_nodes(gm)
         expected = [
             (torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE),
@@ -1101,16 +1154,16 @@ class TestAnnotateModuleFqns(TestCase):
     """Unit tests for annotate_module_fqns and insert_kernel_annotations_pass."""
 
     def _trace_and_get_fqns(self, model, *args):
-        """Trace fwd+bwd with trace_train_step and return module_fqn annotations."""
+        """Trace fwd+bwd via minimal_fx_tracer and return module_fqn annotations."""
 
-        def fwd_step(model, *inputs):
+        def fwd_step(*inputs):
             pred = model(inputs[0])
             loss = pred.sum()
             params = [p for p in model.parameters() if p.requires_grad]
             grads = torch.autograd.grad(loss, params)
             return [loss] + list(grads)
 
-        traced = trace_train_step(fwd_step)(model, *args)
+        traced = minimal_fx_tracer(fwd_step, module=model)(*args)
         fqns = set()
         for node in traced.gm.graph.nodes:
             fqn = (node.meta.get("custom") or {}).get(_MODULE_FQN)
@@ -1119,7 +1172,7 @@ class TestAnnotateModuleFqns(TestCase):
         return fqns
 
     def test_annotate_transformer_like_model(self):
-        """Module FQNs survive trace_train_step for a transformer-like model
+        """Module FQNs survive minimal_fx_tracer for a transformer-like model
         with distinct submodule classes (norm, attention, ffn)."""
 
         class Norm(torch.nn.Module):
@@ -1187,8 +1240,8 @@ class TestAnnotateModuleFqns(TestCase):
     def test_same_class_instances_get_distinct_fqns(self):
         """Two parameterless instances of the same class get distinct fqns.
 
-        Uses minimal_fx_tracer directly (not trace_train_step) because
-        parameterless models cannot produce gradients via autograd.grad.
+        Calls minimal_fx_tracer without ``module=`` because parameterless
+        models cannot produce gradients via autograd.grad.
         """
 
         class Block(torch.nn.Module):
@@ -1207,10 +1260,10 @@ class TestAnnotateModuleFqns(TestCase):
         model = Model()
         annotate_module_fqns(model)
 
-        def fwd_only(state, x):
+        def fwd_only(x):
             return model(x)
 
-        traced = minimal_fx_tracer(fwd_only)({}, torch.randn(4))
+        traced = minimal_fx_tracer(fwd_only)(torch.randn(4))
         fqns = set()
         for node in traced.gm.graph.nodes:
             fqn = (node.meta.get("custom") or {}).get(_MODULE_FQN)
@@ -1538,12 +1591,12 @@ class TestSelectiveActivationRematPass(TestCase):
     def test_offload_reload_chain_hoisted(self):
         """Mirrors the graph the CPU-offload pass produces: a forward
         offload chain (``ao.offload`` -> ``ao.wait_tensor``) and a backward
-        reload chain (``ao.reload`` -> ``ao.wait_tensor``), with
-        ``F.meta["cpu_offload_reload_node"]`` pointing at the backward
-        wait_tensor. When a recomputed node references the offloaded
-        forward node F, the dup must read from the backward wait_tensor on
-        GPU, not from F's freed-GPU storage. The remat pass therefore
-        hoists the backward reload chain in front of the dup's target.
+        reload chain (``ao.reload`` -> ``ao.wait_tensor``). When a
+        recomputed node references the offloaded forward node F, the dup
+        must read from the backward wait_tensor on GPU, not from F's
+        freed-GPU storage. The remat pass discovers the offload chain
+        through graph structure and hoists the backward reload chain in
+        front of the dup's target.
 
             # Forward (autograd_backward=False)
             F           = clone(inp1)
@@ -1588,7 +1641,6 @@ class TestSelectiveActivationRematPass(TestCase):
         graph.output((bwd_use, bwd_other))
 
         n.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
-        f.meta["cpu_offload_reload_node"] = bwd_wait
         bwd_use.meta["autograd_backward"] = True
         reload_op.meta["autograd_backward"] = True
         bwd_wait.meta["autograd_backward"] = True
@@ -1614,7 +1666,7 @@ class TestSelectiveActivationRematPass(TestCase):
         # Forward chain is also before the (hoisted) backward chain.
         self.assertLess(fwd_wait_idx, reload_idx)
 
-        # The dup of N references bwd_wait (via cpu_offload_reload_node
+        # The dup of N references bwd_wait (via the offload chain
         # redirect), not the original offloaded forward node F.
         dup = next(d for d in nodes if d.name.endswith("_recomputed"))
         self.assertIn(bwd_wait, dup.all_input_nodes)
@@ -1685,7 +1737,6 @@ class TestSelectiveActivationRematPass(TestCase):
         graph.output((middle_bwd, bwd_use))
 
         n.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
-        f.meta["cpu_offload_reload_node"] = bwd_wait
         early_bwd.meta["autograd_backward"] = True
         reload_op.meta["autograd_backward"] = True
         bwd_wait.meta["autograd_backward"] = True
