@@ -23,6 +23,7 @@ from torchtitan.config import (
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.grpo import GRPOLoss, RLTrainer
+from torchtitan.experiments.rl.observability.metrics import MetricsProcessor
 from torchtitan.experiments.rl.sum_digits import SumDigitsEnv
 from torchtitan.experiments.rl.veribench_env import VeribenchEnv
 from torchtitan.models.qwen3 import model_registry
@@ -42,6 +43,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
         validation_env=SumDigitsEnv.Config(
             seed=99, correctness_reward=1.0, format_reward=0.3
         ),
+        metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=OptimizersContainer.Config(lr=2e-6),
             lr_scheduler=LRSchedulersContainer.Config(
@@ -150,7 +152,7 @@ def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
 def grpo_qwen3_0_6b_veribench_medium() -> RLTrainer.Config:
     """Qwen3-0.6B GRPO run for the medium-difficulty Veribench subset."""
     config = grpo_qwen3_0_6b_veribench()
-    config.num_steps = 500
+    config.num_steps = 5
     config.env.split = "medium"
     return config
 
@@ -169,6 +171,7 @@ def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
         validation_env=SumDigitsEnv.Config(
             seed=99, correctness_reward=1.0, format_reward=0.3
         ),
+        metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=OptimizersContainer.Config(lr=2e-6),
             lr_scheduler=LRSchedulersContainer.Config(
@@ -223,6 +226,7 @@ def rl_grpo_qwen3_14b() -> RLTrainer.Config:
         validation_env=SumDigitsEnv.Config(
             seed=99, correctness_reward=1.0, format_reward=0.3
         ),
+        metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=OptimizersContainer.Config(lr=1e-6),
             lr_scheduler=LRSchedulersContainer.Config(
@@ -280,6 +284,7 @@ def rl_grpo_qwen3_0_6b_batch_invariant() -> RLTrainer.Config:
         validation_env=SumDigitsEnv.Config(
             seed=99, correctness_reward=1.0, format_reward=0.3
         ),
+        metrics=MetricsProcessor.Config(enable_wandb=True),
         trainer=PolicyTrainer.Config(
             optimizer=OptimizersContainer.Config(lr=2e-6),
             lr_scheduler=LRSchedulersContainer.Config(

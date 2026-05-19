@@ -27,7 +27,9 @@ import json
 import logging
 import math
 import os
+import statistics
 import time
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -39,6 +41,7 @@ import torchstore as ts
 from monarch.actor import this_host
 from monarch.spmd import setup_torch_elastic_env_async
 
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import (
     CompileConfig,
     ConfigManager,
@@ -47,11 +50,12 @@ from torchtitan.config import (
 )
 from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGenerator
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
+from torchtitan.experiments.rl.observability import metrics as m
 from torchtitan.experiments.rl.types import (
     Completion,
     Episode,
     Step,
-    TrainBatch,
+    TrainingBatch,
     Trajectory,
 )
 from torchtitan.observability import structured_logger as sl
@@ -63,11 +67,10 @@ logger = logging.getLogger(__name__)
 async def run_env_step(env: object, completion: str) -> Step:
     """Run a sync or async env.step and return a Step."""
     result = env.step(completion)
-    # Veribench step is async because it calls CodingReward, which runs the evaluator/simulator asynchronously.
     if inspect.isawaitable(result):
         result = await result
     if not isinstance(result, Step):
-        raise TypeError(f"env.step returned {type(result)!r}, expected type was Step")
+        raise TypeError(f"env.step returned {type(result)!r}, expected Step")
     return result
 
 
@@ -77,8 +80,7 @@ async def run_env_steps(
     *,
     concurrency: int,
 ) -> list[tuple[Completion, Step]]:
-    """Score completions with bounded env-step concurrency. 
-    Concurrency controls how many verilog simulator jobs can run at once."""
+    """Score completions with bounded env-step concurrency."""
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def run_one(completion: Completion) -> tuple[Completion, Step]:
@@ -87,6 +89,22 @@ async def run_env_steps(
             return completion, await run_env_step(env, completion.text)
 
     return await asyncio.gather(*(run_one(completion) for completion in completions))
+
+
+def _token_weighted_mean(
+    values: torch.Tensor,
+    *,
+    num_tokens_by_sample: torch.Tensor,
+    num_global_valid_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Each rank's share of the global token-weighted mean of `values`.
+
+    Computed as `sum(values * num_tokens_by_sample) / num_global_valid_tokens`.
+    SUM-reducing this share across the loss mesh reconstructs the global mean.
+    """
+    return (
+        values * num_tokens_by_sample.to(values.dtype)
+    ).sum() / num_global_valid_tokens
 
 
 class GRPOLoss(Configurable):
@@ -108,28 +126,45 @@ class GRPOLoss(Configurable):
         self,
         policy_logprobs: list[torch.Tensor],
         advantages: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        per_sample_mean_lps = []
-        for policy_lps in policy_logprobs:
-            per_sample_mean_lps.append(policy_lps.mean())
+        num_global_valid_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        response_lens = torch.tensor(
+            [sample_logprobs.numel() for sample_logprobs in policy_logprobs],
+            device=advantages.device,
+            dtype=advantages.dtype,
+        )
 
-        mean_log_ratio = torch.stack(per_sample_mean_lps)
-        ratio = torch.exp(mean_log_ratio)
-
-        unclipped_loss = ratio * advantages
+        per_sample_mean_logprobs = torch.stack(
+            [sample_logprobs.mean() for sample_logprobs in policy_logprobs]
+        )
+        ratio = torch.exp(per_sample_mean_logprobs)
         clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
-        clipped_loss = clipped_ratio * advantages
-        pg_loss = -torch.min(unclipped_loss, clipped_loss).mean()
+        # pg = policy gradient.
+        sample_pg_losses = -torch.min(ratio * advantages, clipped_ratio * advantages)
 
-        metrics = {
-            "pg_loss": pg_loss.item(),
-            "ratio_mean": ratio.mean().item(),
-            "ratio_clipped_frac": (torch.abs(ratio - clipped_ratio) > 1e-6)
-            .float()
-            .mean()
-            .item(),
-        }
-        return pg_loss, metrics
+        pg_loss = _token_weighted_mean(
+            sample_pg_losses,
+            num_tokens_by_sample=response_lens,
+            num_global_valid_tokens=num_global_valid_tokens,
+        )
+
+        with torch.no_grad():
+            clipped_frac = (torch.abs(ratio - clipped_ratio) > 1e-6).to(ratio.dtype)
+            loss_metrics = {
+                "loss/mean": pg_loss.detach(),
+                "loss/ratio/mean": _token_weighted_mean(
+                    ratio,
+                    num_tokens_by_sample=response_lens,
+                    num_global_valid_tokens=num_global_valid_tokens,
+                ),
+                "loss/ratio/clipped_frac": _token_weighted_mean(
+                    clipped_frac,
+                    num_tokens_by_sample=response_lens,
+                    num_global_valid_tokens=num_global_valid_tokens,
+                ),
+            }
+
+        return pg_loss, loss_metrics
 
 
 class Provisioner:
@@ -137,8 +172,8 @@ class Provisioner:
 
     In non-colocated mode, the trainer and generator run on separate GPU
     meshes (e.g. GPUs 0-3 for training, GPUs 4-7 for generation). Each
-    call to ``allocate(n)`` reserves the next *n* GPUs and returns a
-    bootstrap callable that sets ``CUDA_VISIBLE_DEVICES`` before CUDA
+    call to `allocate(n)` reserves the next *n* GPUs and returns a
+    bootstrap callable that sets `CUDA_VISIBLE_DEVICES` before CUDA
     initializes in the spawned process, ensuring each mesh only sees its
     own devices.
     """
@@ -168,32 +203,58 @@ class Provisioner:
         return _bootstrap
 
 
-def _mean_rewards(steps: list[Step]) -> dict[str, float]:
-    """Per-component mean reward across a list of Steps."""
-    if not steps:
-        return {}
-    keys = sorted({key for step in steps for key in step.rewards})
-    return {
-        key: sum(step.rewards.get(key, 0.0) for step in steps) / len(steps)
-        for key in keys
-    }
+def _log_samples(items: list[Episode] | list[Completion]) -> None:
+    """Log the first sample per prompt for debugging."""
+    seen_prompts: set[int] = set()
+    for item in items:
+        if item.prompt_idx in seen_prompts:
+            continue
+        seen_prompts.add(item.prompt_idx)
+        reward_str = f" reward={item.reward:+.1f}" if hasattr(item, "reward") else ""
+        logger.info(f"  [prompt {item.prompt_idx}]{reward_str}")
+        logger.info(f"       A: {item.text[:300].replace(chr(10), ' ').strip()}")
 
 
-def _format_rewards(components: dict[str, float]) -> str:
-    return ", ".join(f"{k}={v:+.3f}" for k, v in components.items())
+def _prepare_reward_metrics(
+    prefix: str,
+    trajectories: list[Trajectory],
+) -> list[m.Metric]:
+    """One ``Mean`` metric per observed reward component across trajectories.
 
+    Example::
 
-def _format_validation(result: dict) -> str:
-    return (
-        f"mean_reward={result['mean_reward']:+.3f} "
-        f"({_format_rewards(result['components'])})"
-    )
+        trajectories = [
+            Trajectory(
+                sample_idx=0,
+                prompt_token_ids=p0,
+                transitions=[(c0, Step(rewards={"correctness": 1.0, "format": 0.5}, done=True))],
+            ),
+            Trajectory(
+                sample_idx=1,
+                prompt_token_ids=p1,
+                transitions=[(c1, Step(rewards={"correctness": 0.0}, done=True))],
+            ),
+        ]
+        _prepare_reward_metrics("reward/component", trajectories)
+        # -> [
+        #      Metric("reward/component/correctness", Mean(sum=1.0, count=2)),  # 0.5
+        #      Metric("reward/component/format",      Mean(sum=0.5, count=1)),  # 0.5 - "format" only in trajectory 0
+        #    ]
+    """
+    values_by_name: dict[str, list[float]] = defaultdict(list)
+    for trajectory in trajectories:
+        for _completion, step in trajectory.transitions:
+            for name, value in step.rewards.items():
+                values_by_name[name].append(float(value))
+    return [
+        m.Metric(f"{prefix}/{name}", m.Mean.from_list(values))
+        for name, values in sorted(values_by_name.items())
+    ]
 
 
 def _sample_first_per_prompt(
     items: list[Episode] | list[Completion],
 ) -> list[Episode] | list[Completion]:
-    """Return the same first-per-prompt samples shown by ``_log_samples``."""
     seen_prompts: set[int] = set()
     sampled = []
     for item in items:
@@ -204,14 +265,6 @@ def _sample_first_per_prompt(
     return sampled
 
 
-def _log_samples(items: list[Episode] | list[Completion]) -> None:
-    """Log the first sample per prompt for debugging."""
-    for item in _sample_first_per_prompt(items):
-        reward_str = f" reward={item.reward:+.1f}" if hasattr(item, "reward") else ""
-        logger.info(f"  [prompt {item.prompt_idx}]{reward_str}")
-        logger.info(f"       A: {item.text[:300].replace(chr(10), ' ').strip()}")
-
-
 def _preview_text(value: object, *, max_chars: int = 300) -> str:
     if value is None:
         return ""
@@ -220,41 +273,6 @@ def _preview_text(value: object, *, max_chars: int = 300) -> str:
 
 def _step_metadata(step: Step) -> dict[str, object]:
     return step.metadata or {}
-
-
-def _log_validation_samples(
-    envs: list[object],
-    completion_steps: list[tuple[Completion, Step]],
-    *,
-    max_samples: int = 2,
-) -> None:
-    """Log validation samples with optional env/reward metadata."""
-    for completion, step in completion_steps[:max_samples]:
-        env = envs[completion.prompt_idx]
-        metadata = _step_metadata(step)
-        logger.info(
-            "  [validation prompt %s] problem_id=%s target=%s rewards=%s "
-            "compilation_passed=%s func_passed=%s",
-            completion.prompt_idx,
-            metadata.get("problem_id", getattr(env, "problem_id", None)),
-            metadata.get("target", getattr(env, "target", None)),
-            step.rewards,
-            metadata.get("compilation_passed"),
-            metadata.get("func_passed"),
-        )
-        logger.info(
-            "       question: %s",
-            _preview_text(
-                metadata.get("question", getattr(env, "question", None))
-            ),
-        )
-        logger.info("       completion: %s", _preview_text(completion.text))
-        logger.info(
-            "       final_text: %s",
-            _preview_text(
-                metadata.get("final_text", getattr(env, "final_text", None))
-            ),
-        )
 
 
 def _append_jsonl_record(path: str | None, record: dict[str, object]) -> None:
@@ -285,7 +303,7 @@ def _log_training_step_diagnostics(
     format_failed = sum(item.get("format_passed") is False for item in metadata)
 
     grouped_rewards: dict[int, list[float]] = {}
-    for trajectory, reward in zip(trajectories, rewards):
+    for trajectory, reward in zip(trajectories, rewards, strict=True):
         grouped_rewards.setdefault(trajectory.sample_idx, []).append(reward)
     zero_variance_groups = sum(
         len(group) > 1 and max(group) == min(group)
@@ -294,38 +312,28 @@ def _log_training_step_diagnostics(
 
     total_completions = len(trajectories)
     format_passed = total_completions - format_failed
-    format_passed_rate = (
-        format_passed / total_completions if total_completions else 0.0
-    )
+    format_passed_rate = format_passed / total_completions if total_completions else 0.0
     completions = [trajectory.transitions[0][0] for trajectory in trajectories]
     response_lengths = [len(completion.token_ids) for completion in completions]
-    prompt_lengths = [len(completion.prompt_token_ids) for completion in completions]
+    prompt_lengths = [len(trajectory.prompt_token_ids) for trajectory in trajectories]
     sequence_lengths = [
         prompt_len + response_len
-        for prompt_len, response_len in zip(prompt_lengths, response_lengths)
+        for prompt_len, response_len in zip(prompt_lengths, response_lengths, strict=True)
     ]
     prompt_length_min = min(prompt_lengths) if prompt_lengths else 0
     prompt_length_max = max(prompt_lengths) if prompt_lengths else 0
-    prompt_length_mean = (
-        sum(prompt_lengths) / total_completions if total_completions else 0.0
-    )
+    prompt_length_mean = sum(prompt_lengths) / total_completions if total_completions else 0.0
     sequence_length_min = min(sequence_lengths) if sequence_lengths else 0
     sequence_length_max = max(sequence_lengths) if sequence_lengths else 0
-    sequence_length_mean = (
-        sum(sequence_lengths) / total_completions if total_completions else 0.0
-    )
+    sequence_length_mean = sum(sequence_lengths) / total_completions if total_completions else 0.0
     response_length_min = min(response_lengths) if response_lengths else 0
     response_length_max = max(response_lengths) if response_lengths else 0
-    response_length_mean = (
-        sum(response_lengths) / total_completions if total_completions else 0.0
-    )
-    format_failed_flags = [
-        item.get("format_passed") is False for item in metadata
-    ]
+    response_length_mean = sum(response_lengths) / total_completions if total_completions else 0.0
+    format_failed_flags = [item.get("format_passed") is False for item in metadata]
     max_length_completions = (
         sum(
             is_format_failed and length >= max_response_tokens
-            for is_format_failed, length in zip(format_failed_flags, response_lengths)
+            for is_format_failed, length in zip(format_failed_flags, response_lengths, strict=True)
         )
         if max_response_tokens is not None
         else 0
@@ -372,9 +380,7 @@ def _log_training_step_diagnostics(
             "response_length_mean": response_length_mean,
             "response_length_max": response_length_max,
             "max_length_completion_rate": (
-                max_length_completions / total_completions
-                if total_completions
-                else 0.0
+                max_length_completions / total_completions if total_completions else 0.0
             ),
             "compilation_passed": compilation_passed,
             "func_passed": func_passed,
@@ -384,33 +390,12 @@ def _log_training_step_diagnostics(
         },
     )
 
-def _log_train_batch_stats(step_idx: int, batches: list[TrainBatch]) -> None:
-    summaries: list[str] = []
-    for rank, batch in enumerate(batches):
-        episode_count = len(batch.seq_lens)
-        total_tokens = int(batch.token_ids.numel())
-        prompt_total = sum(batch.prompt_lens)
-        response_total = sum(batch.response_lens)
-        max_seq_len = max(batch.seq_lens) if batch.seq_lens else 0
-        min_seq_len = min(batch.seq_lens) if batch.seq_lens else 0
-        max_prompt_len = max(batch.prompt_lens) if batch.prompt_lens else 0
-        max_response_len = max(batch.response_lens) if batch.response_lens else 0
-        mean_seq_len = sum(batch.seq_lens) / episode_count if episode_count else 0.0
-        mean_response_len = response_total / episode_count if episode_count else 0.0
-        summaries.append(
-            f"rank={rank} episodes={episode_count} total_tokens={total_tokens} "
-            f"seq[min/mean/max]={min_seq_len}/{mean_seq_len:.1f}/{max_seq_len} "
-            f"prompt_total={prompt_total} response_total={response_total} "
-            f"response_mean={mean_response_len:.1f} max_prompt={max_prompt_len} "
-            f"max_response={max_response_len}"
-        )
-    logger.info("Step %2d train batch stats | %s", step_idx, " | ".join(summaries))
-
 
 def _full_completion_record(
     *,
     split: str,
     step_idx: int | None,
+    prompt_token_ids: list[int],
     completion: Completion,
     step: Step,
 ) -> dict[str, object]:
@@ -430,10 +415,9 @@ def _full_completion_record(
         "format_reward": metadata.get("format_reward"),
         "format_failure_reason": metadata.get("format_failure_reason"),
         "empty_response": metadata.get("empty_response"),
-        "prompt_token_count": len(completion.prompt_token_ids),
+        "prompt_token_count": len(prompt_token_ids),
         "completion_token_count": len(completion.token_ids),
-        "sequence_token_count": len(completion.prompt_token_ids)
-        + len(completion.token_ids),
+        "sequence_token_count": len(prompt_token_ids) + len(completion.token_ids),
         "question": metadata.get("question"),
         "final_text": metadata.get("final_text"),
         "extracted_code": metadata.get("extracted_code"),
@@ -471,6 +455,7 @@ def _sampled_training_completion_records(
             _full_completion_record(
                 split="train",
                 step_idx=step_idx,
+                prompt_token_ids=trajectory.prompt_token_ids,
                 completion=completion,
                 step=step,
             )
@@ -479,19 +464,54 @@ def _sampled_training_completion_records(
 
 
 def _sampled_validation_completion_records(
-    completion_steps: list[tuple[Completion, Step]],
+    trajectories: list[Trajectory],
     *,
     max_samples: int = 2,
 ) -> list[dict[str, object]]:
-    return [
-        _full_completion_record(
-            split="validation",
-            step_idx=None,
-            completion=completion,
-            step=step,
+    records = []
+    for trajectory in trajectories[:max_samples]:
+        completion, step = trajectory.transitions[0]
+        records.append(
+            _full_completion_record(
+                split="validation",
+                step_idx=None,
+                prompt_token_ids=trajectory.prompt_token_ids,
+                completion=completion,
+                step=step,
+            )
         )
-        for completion, step in completion_steps[:max_samples]
-    ]
+    return records
+
+
+def _log_validation_samples(
+    envs: list[object],
+    trajectories: list[Trajectory],
+    *,
+    max_samples: int = 2,
+) -> None:
+    for trajectory in trajectories[:max_samples]:
+        completion, step = trajectory.transitions[0]
+        env = envs[completion.prompt_idx]
+        metadata = _step_metadata(step)
+        logger.info(
+            "  [validation prompt %s] problem_id=%s target=%s rewards=%s "
+            "compilation_passed=%s func_passed=%s",
+            completion.prompt_idx,
+            metadata.get("problem_id", getattr(env, "problem_id", None)),
+            metadata.get("target", getattr(env, "target", None)),
+            step.rewards,
+            metadata.get("compilation_passed"),
+            metadata.get("func_passed"),
+        )
+        logger.info(
+            "       question: %s",
+            _preview_text(metadata.get("question", getattr(env, "question", None))),
+        )
+        logger.info("       completion: %s", _preview_text(completion.text))
+        logger.info(
+            "       final_text: %s",
+            _preview_text(metadata.get("final_text", getattr(env, "final_text", None))),
+        )
 
 
 def _log_training_completion_samples(
@@ -514,13 +534,9 @@ def _log_training_completion_samples(
             metadata.get("compilation_passed"),
             metadata.get("func_passed"),
         )
-        logger.info(
-            "       question: %s", _preview_text(metadata.get("question"))
-        )
+        logger.info("       question: %s", _preview_text(metadata.get("question")))
         logger.info("       completion: %s", _preview_text(completion.text))
-        logger.info(
-            "       final_text: %s", _preview_text(metadata.get("final_text"))
-        )
+        logger.info("       final_text: %s", _preview_text(metadata.get("final_text")))
 
 
 class RLTrainer(Configurable):
@@ -546,8 +562,8 @@ class RLTrainer(Configurable):
         num_prompts_per_step: int = 5
         """Number of distinct prompts (= GRPO groups) drawn per training step.
 
-        The total episodes per step is ``num_prompts_per_step * group_size``,
-        where ``group_size`` is ``generator.sampling.n`` (completions per prompt).
+        The total episodes per step is `num_prompts_per_step` * `group_size`,
+        where `group_size` is `generator.sampling.n` (completions per prompt).
         """
 
         num_validation_samples: int = 20
@@ -575,6 +591,10 @@ class RLTrainer(Configurable):
 
         generator: VLLMGenerator.Config = field(default_factory=VLLMGenerator.Config)
         """VLLMGenerator actor configuration (vLLM engine, sampling)."""
+
+        metrics: m.MetricsProcessor.Config = field(
+            default_factory=m.MetricsProcessor.Config
+        )
 
         def __post_init__(self):
             if self.generator.checkpoint.enable:
@@ -607,12 +627,12 @@ class RLTrainer(Configurable):
                     )
 
     def __init__(self, config: Config):
+        output_dir = os.environ.get("TORCHTITAN_RL_OUTPUT_DIR") or config.dump_folder
+        config.dump_folder = output_dir
         self.config = config
         self.trainer = None
         self.generator = None
         self._proc_meshes = []
-        output_dir = os.environ.get("TORCHTITAN_RL_OUTPUT_DIR") or config.dump_folder
-        config.dump_folder = output_dir
         self.full_completion_log_path = os.path.join(
             output_dir,
             "full_sample_completions.jsonl",
@@ -621,6 +641,12 @@ class RLTrainer(Configurable):
             output_dir,
             "final_text_completion_stats.jsonl",
         )
+        self.metrics_processor: m.MetricsProcessor = config.metrics.build(
+            log_dir=config.dump_folder,
+            job_config=config.to_dict(),
+        )
+        # TODO: Replace this single-turn tokenizer with renderer
+        self.tokenizer = HuggingFaceTokenizer(tokenizer_path=config.hf_assets_path)
         if config.log_samples:
             logger.info(
                 "Full --log_samples completions will be written to %s",
@@ -632,7 +658,7 @@ class RLTrainer(Configurable):
         )
 
     async def close(self):
-        """Best-effort: tear down actors, then stop proc meshes."""
+        """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
         logger.info("Closing: tearing down actors and process meshes.")
         for actor_name, actor in (
             ("trainer", self.trainer),
@@ -644,6 +670,11 @@ class RLTrainer(Configurable):
                 await actor.close.call()
             except Exception:
                 logger.exception("%s.close failed", actor_name)
+
+        try:
+            self.metrics_processor.close()
+        except Exception:
+            logger.exception("metrics_processor close failed")
 
         for i, mesh in enumerate(self._proc_meshes):
             try:
@@ -688,8 +719,8 @@ class RLTrainer(Configurable):
 
     @staticmethod
     @sl.log_trace_span("_collate_episodes")
-    def _collate_episodes(episodes: list[Episode]) -> TrainBatch:
-        """Pack episodes into a single varlen-packed TrainBatch."""
+    def _collate_episodes(episodes: list[Episode]) -> TrainingBatch:
+        """Pack episodes into a single varlen-packed TrainingBatch."""
         all_ids: list[int] = []
         prompt_lens: list[int] = []
         response_lens: list[int] = []
@@ -699,11 +730,11 @@ class RLTrainer(Configurable):
             prompt_lens.append(len(ep.prompt_token_ids))
             response_lens.append(len(ep.token_ids))
 
-        return TrainBatch(
+        return TrainingBatch(
             token_ids=torch.tensor([all_ids], dtype=torch.long),
             prompt_lens=prompt_lens,
             response_lens=response_lens,
-            seq_lens=[p + r for p, r in zip(prompt_lens, response_lens)],
+            seq_lens=[p + r for p, r in zip(prompt_lens, response_lens, strict=True)],
             advantages=torch.tensor(
                 [ep.advantage for ep in episodes],
                 dtype=torch.float32,
@@ -711,8 +742,8 @@ class RLTrainer(Configurable):
             token_logprobs=[ep.token_logprobs for ep in episodes],
         )
 
-    @sl.log_trace_span("setup")
-    async def setup(
+    @sl.log_trace_span("setup_async")
+    async def setup_async(
         self,
         *,
         host_mesh=None,
@@ -721,6 +752,11 @@ class RLTrainer(Configurable):
         gpus_per_node: int | None = None,
     ):
         """Spawn Monarch actors on separate meshes and initialize weights.
+
+        Kept separate from ``__init__`` because actor spawning, torch
+        elastic env setup, TorchStore initialization, and the initial
+        weight push/pull are all ``await``-based runtime side effects
+        that cannot run in a synchronous constructor.
 
         Creates separate GPU meshes for trainer and generator and
         synchronizes initial weights from trainer to generator. Must be
@@ -868,37 +904,77 @@ class RLTrainer(Configurable):
             self.generator.pull_model_state_dict.call(0).get()
 
     @sl.log_trace_span("_collect_rollouts")
-    async def _collect_rollouts(self, num_groups: int, step: int) -> list[Trajectory]:
-        """Collect group rollouts: one single-use env per group, scored and returned."""
+    async def _collect_rollouts(
+        self,
+        num_groups: int,
+        step: int,
+    ) -> tuple[list[Trajectory], list[m.Metric]]:
+        """Collect group rollouts and emit completion-shape rollout metrics."""
         envs = [
             self.config.env.build(step=step, group_idx=i) for i in range(num_groups)
         ]
-        completions = self._get_rank_0_value(
-            self.generator.generate.call([env.prompt for env in envs]).get()
+        # TODO: Add a check max_tokens = min(max_tokens, context_window - model_input.length)
+        # and pass max_tokens to the generator call or skip the call if max_tokens<=0.
+        # Do the same for validation.
+        tokenized_prompts = [
+            self.tokenizer.encode(env.prompt, add_bos=True, add_eos=False)
+            for env in envs
+        ]
+        completions, generation_metrics = self._get_rank_0_value(
+            self.generator.generate.call(tokenized_prompts).get()
         )
+
         with sl.log_trace_span("score"):
             completion_steps = await run_env_steps(
                 envs,
                 completions,
                 concurrency=self.config.env_step_concurrency,
             )
-        return [
-            Trajectory(sample_idx=c.prompt_idx, transitions=[(c, step_result)])
+        trajectories = [
+            Trajectory(
+                sample_idx=c.prompt_idx,
+                prompt_token_ids=tokenized_prompts[c.prompt_idx],
+                transitions=[(c, step_result)],
+            )
             for c, step_result in completion_steps
         ]
 
+        # Metrics
+        response_lens = [len(c.token_ids) for c in completions]
+        prompt_lens = [len(t.prompt_token_ids) for t in trajectories]
+        total_lens = [p + r for p, r in zip(prompt_lens, response_lens, strict=True)]
+        truncated = [c.finish_reason == "length" for c in completions]
+        rollout_metrics: list[m.Metric] = [
+            m.Metric("rollout/response_length", m.Mean.from_list(response_lens)),
+            m.Metric("rollout/response_length", m.Max.from_list(response_lens)),
+            m.Metric("rollout/prompt_length", m.Mean.from_list(prompt_lens)),
+            m.Metric("rollout/prompt_length", m.Max.from_list(prompt_lens)),
+            m.Metric("rollout/total_length", m.Max.from_list(total_lens)),
+            m.Metric("rollout/truncation_rate", m.Mean.from_list(truncated)),
+        ]
+        rollout_metrics += generation_metrics
+        rollout_metrics += _prepare_reward_metrics(
+            prefix="reward/component", trajectories=trajectories
+        )
+        return trajectories, rollout_metrics
+
     @staticmethod
     @sl.log_trace_span("_build_episodes")
-    def _build_episodes(trajectories: list[Trajectory]) -> list[Episode]:
-        """Group trajectories by sample, apply mean-baseline advantage, flatten to Episodes."""
+    def _build_episodes(
+        trajectories: list[Trajectory],
+    ) -> tuple[list[Episode], list[m.Metric]]:
+        """Group trajectories by sample, apply mean-baseline advantage, emit metrics."""
         groups: dict[int, list[Trajectory]] = {}
         for t in trajectories:
             groups.setdefault(t.sample_idx, []).append(t)
 
         episodes: list[Episode] = []
+        group_stds: list[float] = []
         for sample_idx, group in groups.items():
             rewards = [t.total_reward for t in group]
             group_mean = sum(rewards) / len(rewards)
+            # Population standard deviation; NaN for an empty group.
+            group_stds.append(statistics.pstdev(float(r) for r in rewards))
             for t in group:
                 # Single-turn: exactly one (completion, step) per trajectory.
                 c, _ = t.transitions[0]
@@ -906,7 +982,7 @@ class RLTrainer(Configurable):
                     Episode(
                         policy_version=c.policy_version,
                         prompt_idx=sample_idx,
-                        prompt_token_ids=c.prompt_token_ids,
+                        prompt_token_ids=t.prompt_token_ids,
                         text=c.text,
                         token_ids=c.token_ids,
                         token_logprobs=c.token_logprobs,
@@ -914,12 +990,48 @@ class RLTrainer(Configurable):
                         advantage=t.total_reward - group_mean,
                     )
                 )
-        return episodes
+
+        num_groups = len(groups)
+        zero_std_frac = (
+            sum(1 for s in group_stds if s == 0.0) / num_groups if num_groups else 0.0
+        )
+        episode_metrics: list[m.Metric] = [
+            m.Metric(
+                "reward",
+                m.SummaryStats.from_list([ep.reward for ep in episodes]),
+            ),
+            m.Metric(
+                "advantage",
+                m.SummaryStats.from_list([ep.advantage for ep in episodes]),
+            ),
+            m.Metric("reward/group_std", m.Mean.from_list(group_stds)),
+            m.Metric("reward/group_std", m.Max.from_list(group_stds)),
+            m.Metric("reward/zero_std_frac", m.NoReduce(zero_std_frac)),
+        ]
+
+        # Per-rollout policy versions. We log max/min in case episodes come
+        # from multiple rollout versions.
+        policy_versions = [episode.policy_version for episode in episodes]
+        if policy_versions:
+            episode_metrics.extend(
+                [
+                    m.Metric(
+                        "rollout/policy_version", m.Min.from_list(policy_versions)
+                    ),
+                    m.Metric(
+                        "rollout/policy_version", m.Max.from_list(policy_versions)
+                    ),
+                ]
+            )
+        return episodes, episode_metrics
 
     @sl.log_trace_span("validate")
-    async def validate(self) -> dict:
+    async def validate(self) -> list[m.Metric]:
         """Run validation on held-out prompts using greedy sampling.
-        TODO: investigate using pass@k."""
+
+        TODO: investigate using pass@k.
+        """
+        t_validate_start = time.perf_counter()
         num_samples = self.config.num_validation_samples
         envs = [
             self.config.validation_env.build(step=0, group_idx=i)
@@ -931,9 +1043,16 @@ class RLTrainer(Configurable):
             top_p=1.0,
             max_tokens=self.config.generator.sampling.max_tokens,
         )
-        completions = self._get_rank_0_value(
+
+        tokenized_prompts: list[list[int]] = [
+            self.tokenizer.encode(env.prompt, add_bos=True, add_eos=False)
+            for env in envs
+        ]
+        completions, generation_metrics = self._get_rank_0_value(
             self.generator.generate.call(
-                [env.prompt for env in envs], sampling_config=greedy
+                tokenized_prompts,
+                sampling_config=greedy,
+                metrics_prefix="validation_generator",
             ).get()
         )
 
@@ -942,28 +1061,59 @@ class RLTrainer(Configurable):
             completions,
             concurrency=self.config.env_step_concurrency,
         )
-        steps = [step for _, step in completion_steps]
+        trajectories = [
+            Trajectory(
+                sample_idx=c.prompt_idx,
+                prompt_token_ids=tokenized_prompts[c.prompt_idx],
+                transitions=[(c, step_result)],
+            )
+            for c, step_result in completion_steps
+        ]
 
         if self.config.log_samples:
-            _log_validation_samples(envs, completion_steps)
+            _log_samples(completions)
+            _log_validation_samples(envs, trajectories)
             _append_full_completion_records(
                 self.full_completion_log_path,
-                _sampled_validation_completion_records(completion_steps),
+                _sampled_validation_completion_records(trajectories),
             )
 
-        components = _mean_rewards(steps)
-        return {
-            "mean_reward": sum(components.values()),
-            "components": components,
-            "total": num_samples,
-        }
+        validation_metrics: list[m.Metric] = [
+            m.Metric(
+                "validation/reward",
+                m.SummaryStats.from_list([t.total_reward for t in trajectories]),
+            ),
+            m.Metric(
+                "validation/response_length",
+                m.Mean.from_list([len(c.token_ids) for c in completions]),
+            ),
+            m.Metric("validation/num_samples", m.NoReduce(float(len(trajectories)))),
+        ]
+        validation_metrics += generation_metrics
+        validation_metrics += _prepare_reward_metrics(
+            prefix="validation/reward/component", trajectories=trajectories
+        )
+
+        t_validate_s = time.perf_counter() - t_validate_start
+        validation_metrics.append(m.Metric("timing/validate", m.NoReduce(t_validate_s)))
+        return validation_metrics
 
     async def train(self):
         num_steps = self.config.num_steps
         num_groups = self.config.num_prompts_per_step
         logger.info(f"Pre-training validation; then {num_steps} steps of RL training")
-        pre_validation = await self.validate()
-        logger.info(f"Pre:  {_format_validation(pre_validation)}")
+
+        # collect validation metrics before training
+        # so we can compare before/after
+        pre_validation_metrics = await self.validate()
+        self.metrics_processor.log(
+            step=0,
+            metrics=pre_validation_metrics,
+            is_validation=True,
+        )
+        pre_validation_agg = m.MetricsProcessor._aggregate_metrics(
+            pre_validation_metrics
+        )
 
         sl.log_trace_instant("training_start")
 
@@ -978,17 +1128,16 @@ class RLTrainer(Configurable):
             # TODO: investigate replacing `.get()` with `await
             await asyncio.sleep(0)
 
-            step_start = time.perf_counter()
+            t_step_start = time.perf_counter()
 
-            # --- Collect data and create episodes --- #
-            trajectories = await self._collect_rollouts(num_groups, step=step)
-            episodes = self._build_episodes(trajectories)
-            logger.info(
-                "Step %2d collected %d rollouts and built %d episodes",
-                step,
-                len(trajectories),
-                len(episodes),
+            # --- rollouts ---
+            t_rollout_start = time.perf_counter()
+            trajectories, rollout_metrics = await self._collect_rollouts(
+                num_groups, step=step
             )
+            episodes, episode_metrics = self._build_episodes(trajectories)
+            t_rollout_s = time.perf_counter() - t_rollout_start
+
             _log_training_step_diagnostics(
                 step,
                 trajectories,
@@ -1009,58 +1158,106 @@ class RLTrainer(Configurable):
                     ),
                 )
 
-            # --- Train step --- #
+            # --- train ---
+            t_train_start = time.perf_counter()
             batches = [
                 self._collate_episodes(per_rank_episodes)
                 for per_rank_episodes in self._shard_episodes(episodes)
             ]
-            _log_train_batch_stats(step, batches)
+            # Controller has all episodes pre-shard, so it computes
+            # the global response-token count instead of an all-reduce.
+            num_global_valid_tokens = sum(len(ep.token_ids) for ep in episodes)
             with sl.log_trace_span("trainer_forward_backward_call"):
                 fwd_bwd_metrics = self._get_rank_0_value(
-                    self.trainer.forward_backward.call(batches).get()
+                    self.trainer.forward_backward.call(
+                        batches,
+                        num_global_valid_tokens=num_global_valid_tokens,
+                    ).get()
                 )
-
             with sl.log_trace_span("trainer_optim_step_call"):
-                optim_metrics = self._get_rank_0_value(
+                optim_output = self._get_rank_0_value(
                     self.trainer.optim_step.call().get()
                 )
-            metrics = {**fwd_bwd_metrics, **optim_metrics}
+            trainer_policy_version = optim_output.policy_version
+            optimizer_metrics = optim_output.metrics
+            t_train_s = time.perf_counter() - t_train_start
 
-            # --- Weight sync --- #
+            # --- weight sync ---
+            # TODO: we should have `push_model_state_dict` return `trainer_policy_version`
+            # instead of having `trainer.optim_step` return it
+            t_push_start = time.perf_counter()
             with sl.log_trace_span("trainer_push_model_state_dict"):
-                t0 = time.perf_counter()
                 self.trainer.push_model_state_dict.call().get()
-                t_push = time.perf_counter() - t0
+            t_weight_sync_push_s = time.perf_counter() - t_push_start
             with sl.log_trace_span("generator_pull_model_state_dict"):
-                self.generator.pull_model_state_dict.call(
-                    metrics["policy_version"]
-                ).get()
-                t_sync = time.perf_counter() - t0
-            logger.info(f"Weight sync: push={t_push:.3f}s, total={t_sync:.3f}s")
-
-            # --- Logging --- #
-            steps = [t.transitions[0][1] for t in trajectories]
-            components = _mean_rewards(steps)
-            avg_tokens = sum(len(ep.token_ids) for ep in episodes) / len(episodes)
-            logger.info(
-                f"Step {step:2d} | Loss: {metrics['loss']:+.4f} | "
-                f"Reward: {sum(components.values()):+.3f} ({_format_rewards(components)}) | "
-                f"Avg tokens: {avg_tokens:>3.0f} | "
-                f"Logprob diff: mean={metrics['logprob_diff_mean']:.4e}, "
-                f"max={metrics['logprob_diff_max']:.4e} | "
-                f"Time: {time.perf_counter() - step_start:.1f}s"
-            )
-
-            if not math.isfinite(metrics["loss"]):
+                self.generator.pull_model_state_dict.call(trainer_policy_version).get()
+            t_weight_sync_total_s = time.perf_counter() - t_push_start
+            t_step_s = time.perf_counter() - t_step_start
+            # --- divergence check before any logging ---
+            if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
                 logger.error("Loss is NaN/Inf; training diverged")
                 break
 
-        logger.info("Post-training validation")
-        post_validation = await self.validate()
-        logger.info(
-            f"Summary:\n  Pre:  {_format_validation(pre_validation)}\n"
-            f"  Post: {_format_validation(post_validation)}"
+            # --- Prepare metrics ---
+            total_tokens = sum(
+                len(ep.prompt_token_ids) + len(ep.token_ids) for ep in episodes
+            )
+
+            step_metrics: list[m.Metric] = []
+
+            step_metrics += rollout_metrics
+            step_metrics += episode_metrics
+
+            # Actor metrics are already globally reduced; NoReduce passes them through.
+            step_metrics += [
+                m.Metric(k, m.NoReduce(v)) for k, v in fwd_bwd_metrics.items()
+            ]
+            step_metrics += [
+                m.Metric(k, m.NoReduce(v)) for k, v in optimizer_metrics.items()
+            ]
+
+            # timing metrics
+            for key, value in [
+                ("timing/step", t_step_s),
+                ("timing/rollout", t_rollout_s),
+                ("timing/train", t_train_s),
+                ("timing/weight_sync/push", t_weight_sync_push_s),
+                ("timing/weight_sync/total", t_weight_sync_total_s),
+            ]:
+                step_metrics.append(m.Metric(key, m.NoReduce(value)))
+
+            step_metrics.append(
+                m.Metric("perf/tokens_per_second", m.NoReduce(total_tokens / t_step_s))
+            )
+
+            self.metrics_processor.log(
+                step=step, metrics=step_metrics, is_validation=False
+            )
+
+        post_validation_metrics = await self.validate()
+        self.metrics_processor.log(
+            step=num_steps,
+            metrics=post_validation_metrics,
+            is_validation=True,
         )
+        post_validation_agg = m.MetricsProcessor._aggregate_metrics(
+            post_validation_metrics
+        )
+
+        # Side-by-side pre/post summary so the before/after improvement is
+        # visible without scrolling back through the train loop.
+        reward_keys = sorted(
+            k
+            for k in set(pre_validation_agg) | set(post_validation_agg)
+            if "reward" in k
+        )
+        logger.info("=" * 60)
+        logger.info("Validation summary (pre / post):")
+        for key in reward_keys:
+            pre = pre_validation_agg.get(key, float("nan"))
+            post = post_validation_agg.get(key, float("nan"))
+            logger.info(f"  {key}:  {pre:+.3f}  /  {post:+.3f}")
+        logger.info("=" * 60)
 
 
 async def main():
@@ -1076,13 +1273,10 @@ async def main():
 
     rl_trainer = RLTrainer(config)
     try:
-        await rl_trainer.setup()
+        await rl_trainer.setup_async()
         await rl_trainer.train()
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Interrupted; attempting graceful shutdown...")
-    except Exception:
-        logger.exception("RLTrainer failed; attempting graceful shutdown...")
-        raise
     finally:
         await rl_trainer.close()
 
