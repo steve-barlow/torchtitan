@@ -89,7 +89,7 @@ def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
     return RLTrainer.Config(
         model_spec=model_spec,
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
-        num_steps=5,
+        num_steps=100,
         num_prompts_per_step=6,
         num_validation_samples=8,
         env_step_concurrency=4,
@@ -145,6 +145,14 @@ def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
             ),
         ),
     )
+
+
+def grpo_qwen3_0_6b_veribench_medium() -> RLTrainer.Config:
+    """Qwen3-0.6B GRPO run for the medium-difficulty Veribench subset."""
+    config = grpo_qwen3_0_6b_veribench()
+    config.num_steps = 500
+    config.env.split = "medium"
+    return config
 
 
 def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:

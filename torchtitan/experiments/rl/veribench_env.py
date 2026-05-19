@@ -60,8 +60,8 @@ class VeribenchEnv(Configurable):
     def _validate_config(config: Config) -> None:
         if not config.tokenizer_path:
             raise ValueError("tokenizer_path must be set")
-        if config.split not in ("train", "validation"):
-            raise ValueError("split must be 'train' or 'validation'")
+        if config.split not in ("train", "validation", "medium"):
+            raise ValueError("split must be 'train', 'validation', or 'medium'")
 
     def _select_problem_id(self, *, step: int = 0, group_idx: int = 0) -> int:
         if step < 0:
