@@ -4,9 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -103,8 +106,10 @@ class PolicyTrainer(Actor, Configurable):
         )
         sl.log_trace_instant("structured_logger_started")
 
+        config.dump_folder = output_dir
         self.config = config
         self.compile_config = compile_config
+        self.output_dir = output_dir
         self.loss_fn = config.loss.build()
 
         # Only cast if generator dtype differs from training dtype, otherwise
@@ -117,6 +122,17 @@ class PolicyTrainer(Actor, Configurable):
         device_module, device_type = utils.device_module, utils.device_type
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         device_module.set_device(self.device)
+        self.global_rank = current_rank().rank
+        self.local_rank = int(os.environ["LOCAL_RANK"])
+        self.memory_log_path = (
+            Path(output_dir)
+            / f"trainer_gpu_memory_rank_{self.global_rank}_local_{self.local_rank}.jsonl"
+        )
+        self.batch_load_log_path = (
+            Path(output_dir)
+            / f"trainer_batch_load_rank_{self.global_rank}_local_{self.local_rank}.jsonl"
+        )
+        self.memory_log_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Enable batch-invariant mode BEFORE init_distributed
         set_batch_invariance(config.debug.batch_invariant)
@@ -190,6 +206,66 @@ class PolicyTrainer(Actor, Configurable):
         logger.debug(
             f"PolicyTrainer initialized (dp_rank={self.dp_rank}, dp_size={self.dp_size})"
         )
+        self._log_cuda_memory("trainer_init_end")
+
+    def _log_cuda_memory(self, phase: str, *, step: int | None = None) -> None:
+        """Append one CUDA memory-pressure snapshot for this trainer rank."""
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+            record = {
+                "time_ms": int(time.time() * 1000),
+                "phase": phase,
+                "step": step,
+                "policy_version": self.policy_version,
+                "global_rank": self.global_rank,
+                "local_rank": self.local_rank,
+                "dp_rank": self.dp_rank,
+                "dp_size": self.dp_size,
+                "device": str(self.device),
+                "allocated_gib": torch.cuda.memory_allocated(self.device) / (1024**3),
+                "reserved_gib": torch.cuda.memory_reserved(self.device) / (1024**3),
+                "max_allocated_gib": torch.cuda.max_memory_allocated(self.device) / (1024**3),
+                "max_reserved_gib": torch.cuda.max_memory_reserved(self.device) / (1024**3),
+                "free_gib": free_bytes / (1024**3),
+                "total_gib": total_bytes / (1024**3),
+            }
+            with self.memory_log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception:
+            logger.exception("Failed to write trainer CUDA memory snapshot")
+
+    def _log_batch_load(self, batch: TrainingBatch, *, step: int) -> None:
+        """Append one local batch token-load summary for this trainer rank."""
+        try:
+            seq_lens = [int(x) for x in batch.seq_lens]
+            prompt_lens = [int(x) for x in batch.prompt_lens]
+            response_lens = [int(x) for x in batch.response_lens]
+            record = {
+                "time_ms": int(time.time() * 1000),
+                "step": step,
+                "policy_version": self.policy_version,
+                "global_rank": self.global_rank,
+                "local_rank": self.local_rank,
+                "dp_rank": self.dp_rank,
+                "dp_size": self.dp_size,
+                "num_episodes": len(seq_lens),
+                "total_tokens": int(sum(seq_lens)),
+                "total_prompt_tokens": int(sum(prompt_lens)),
+                "total_response_tokens": int(sum(response_lens)),
+                "max_sequence_tokens": int(max(seq_lens, default=0)),
+                "min_sequence_tokens": int(min(seq_lens, default=0)),
+                "max_response_tokens": int(max(response_lens, default=0)),
+                "min_response_tokens": int(min(response_lens, default=0)),
+                "sequence_lens": seq_lens,
+                "prompt_lens": prompt_lens,
+                "response_lens": response_lens,
+            }
+            with self.batch_load_log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception:
+            logger.exception("Failed to write trainer batch-load snapshot")
 
     def state_dict(self) -> dict[str, Any]:
         return {"policy_version": self.policy_version}
@@ -334,13 +410,18 @@ class PolicyTrainer(Actor, Configurable):
         model = self.model_parts[0]
 
         local_batch = train_data[self.dp_rank]
+        self._log_batch_load(local_batch, step=self.policy_version + 1)
         device = self.device
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        self._log_cuda_memory("forward_backward_start", step=self.policy_version + 1)
 
         token_ids = local_batch.token_ids.to(device)
         seq_lens = local_batch.seq_lens
         prompt_lens = local_batch.prompt_lens
         response_lens = local_batch.response_lens
         advantages = local_batch.advantages.to(device)
+        self._log_cuda_memory("after_batch_to_device", step=self.policy_version + 1)
 
         max_seq_len = max(seq_lens)
         rope_cache_len = self.model.freqs_cis.shape[0]
@@ -362,11 +443,14 @@ class PolicyTrainer(Actor, Configurable):
         ).unsqueeze(0)
         attention_masks = create_varlen_metadata_for_document(positions)
 
+        self._log_cuda_memory("before_model_forward", step=self.policy_version + 1)
         with sl.log_trace_span("model_forward"):
             logits = model(
                 token_ids, attention_masks=attention_masks, positions=positions
             )
+        self._log_cuda_memory("after_model_forward", step=self.policy_version + 1)
         all_policy_logprobs = compute_logprobs(logits, token_ids)
+        self._log_cuda_memory("after_compute_logprobs", step=self.policy_version + 1)
         policy_logprobs = extract_response_logprobs(
             all_policy_logprobs, seq_lens, prompt_lens, response_lens
         )
@@ -377,10 +461,13 @@ class PolicyTrainer(Actor, Configurable):
                 advantages=advantages,
                 num_global_valid_tokens=num_global_valid_tokens,
             )
+        self._log_cuda_memory("after_loss_fn", step=self.policy_version + 1)
 
         self.optimizers.zero_grad()
+        self._log_cuda_memory("after_zero_grad", step=self.policy_version + 1)
         with sl.log_trace_span("model_backward"):
             loss.backward()
+        self._log_cuda_memory("after_model_backward", step=self.policy_version + 1)
 
         # Metrics for bitwise verification of policy logprobs.
         verification: PartialLogprobDrift = verify_logprob_identity(
@@ -421,6 +508,7 @@ class PolicyTrainer(Actor, Configurable):
             )
         current_lr = float(current_lrs[0])
 
+        self._log_cuda_memory("optim_step_start", step=self.policy_version + 1)
         with sl.log_trace_span("grad_clip"):
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
@@ -428,12 +516,15 @@ class PolicyTrainer(Actor, Configurable):
                 foreach=True,
                 pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             )
+        self._log_cuda_memory("after_grad_clip", step=self.policy_version + 1)
 
         with sl.log_trace_span("optim"):
             self.optimizers.step()
             self.lr_schedulers.step()
+        self._log_cuda_memory("after_optim", step=self.policy_version + 1)
 
         self.policy_version += 1
+        self._log_cuda_memory("optim_step_end", step=self.policy_version)
 
         logger.debug(
             f"{os.getpid()=} PolicyTrainer optim_step done, "

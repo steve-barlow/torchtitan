@@ -12,6 +12,7 @@ from typing import Any, Mapping, cast
 
 from evalsets.veribench.dataset import VeribenchSplit, load_veribench
 from evalsets.veribench.eval_set import SYSTEM_PROMPT
+from evalsets.veribench.evaluator import count_tests
 from post_training_torchtitan.app import qwen_prompt_formatting
 from post_training_torchtitan.app.grading import CodingReward, FormatReward
 from torchtitan.config import Configurable
@@ -49,6 +50,7 @@ class VeribenchEnv(Configurable):
         self.problem_id = self._select_problem_id(step=step, group_idx=group_idx)
         example = self._examples[self.problem_id]
         self.question = str(example["question"])
+        self.num_tests = count_tests(str(example.get("testbench", "")))
         self.target = f"problem_{self.problem_id:05d}"
         self.prompt = self._format_prompt(self.question)
         self.raw_completion: str | None = None
@@ -97,6 +99,7 @@ class VeribenchEnv(Configurable):
             "problem_id": self.problem_id,
             "target": self.target,
             "question": self.question,
+            "num_tests": self.num_tests,
             "format_passed": format_result.passed,
             "format_reward": format_result.reward,
             "format_failure_reason": format_result.failure_reason,
@@ -114,6 +117,7 @@ class VeribenchEnv(Configurable):
                     "coding_reward_log": "",
                     "compilation_passed": None,
                     "func_passed": None,
+                    "num_tests_passed": 0,
                     "empty_response": not bool(completion.strip()),
                 }
             )
@@ -137,6 +141,8 @@ class VeribenchEnv(Configurable):
                 "coding_reward_log": coding_result.details.get("log", ""),
                 "compilation_passed": coding_result.details.get("compilation_passed"),
                 "func_passed": coding_result.details.get("func_passed"),
+                "num_tests": coding_result.details.get("num_tests", self.num_tests),
+                "num_tests_passed": coding_result.details.get("num_tests_passed", 0),
                 "empty_response": bool(coding_result.details.get("empty_response", False)),
             }
         )

@@ -15,6 +15,7 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import (
+    ActivationCheckpointConfig,
     CompileConfig,
     DebugConfig,
     ParallelismConfig,
@@ -92,10 +93,15 @@ def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
         model_spec=model_spec,
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=100,
-        num_prompts_per_step=6,
+        num_prompts_per_step=4,
         num_validation_samples=8,
         env_step_concurrency=4,
         log_samples=True,
+        metrics=MetricsProcessor.Config(
+            enable_wandb=True,
+            enable_tensorboard=True,
+            wandb_project="ishikori",
+        ),
         compile=CompileConfig(enable=True, backend="aot_eager"),
         env=VeribenchEnv.Config(
             split="train",
@@ -110,6 +116,7 @@ def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
             compilation_credit=0.1,
         ),
         trainer=PolicyTrainer.Config(
+            ac_config=ActivationCheckpointConfig(mode="full"),
             optimizer=OptimizersContainer.Config(lr=2e-6),
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=2,
@@ -140,7 +147,7 @@ def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=4,
+                n=8,
                 temperature=1,
                 top_p=0.95,
                 max_tokens=4096,
@@ -154,6 +161,24 @@ def grpo_qwen3_0_6b_veribench_medium() -> RLTrainer.Config:
     config = grpo_qwen3_0_6b_veribench()
     config.num_steps = 5
     config.env.split = "medium"
+    return config
+
+
+def grpo_qwen3_8b_veribench_medium() -> RLTrainer.Config:
+    """Qwen3-8B GRPO smoke run for the medium-difficulty Veribench subset."""
+    config = grpo_qwen3_0_6b_veribench()
+    model_spec = model_registry("8B", attn_backend="varlen")
+    model_spec.model.rope.max_seq_len = 5120
+    config.model_spec = model_spec
+    config.hf_assets_path = "torchtitan/experiments/rl/example_checkpoint/Qwen3-8B"
+    config.num_steps = 5
+    config.env.split = "medium"
+    config.trainer.training.seq_len = 5120
+    config.trainer.checkpoint.last_save_model_only = True
+    config.trainer.checkpoint.last_save_in_hf = True
+    config.trainer.checkpoint.export_dtype = "bfloat16"
+    config.generator.sampling.n = 4
+    config.generator.sampling.max_tokens = 4096
     return config
 
 

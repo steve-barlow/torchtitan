@@ -59,6 +59,9 @@ from torchtitan.experiments.rl.types import (
     Trajectory,
 )
 from torchtitan.observability import structured_logger as sl
+from torchtitan.observability.structured_logger.gantt_generator import (
+    generate_gantt_trace,
+)
 from torchtitan.protocols.model_spec import ModelSpec
 
 logger = logging.getLogger(__name__)
@@ -406,13 +409,12 @@ def _full_completion_record(
         "prompt_idx": completion.prompt_idx,
         "policy_version": completion.policy_version,
         "problem_id": metadata.get("problem_id"),
-        "target": metadata.get("target"),
         "rewards": step.rewards,
         "compilation_passed": metadata.get("compilation_passed"),
         "func_passed": metadata.get("func_passed"),
+        "num_tests": metadata.get("num_tests"),
+        "num_tests_passed": metadata.get("num_tests_passed"),
         "format_passed": metadata.get("format_passed"),
-        "format_failed": metadata.get("format_passed") is False,
-        "format_reward": metadata.get("format_reward"),
         "format_failure_reason": metadata.get("format_failure_reason"),
         "empty_response": metadata.get("empty_response"),
         "prompt_token_count": len(prompt_token_ids),
@@ -427,7 +429,7 @@ def _full_completion_record(
     }
 
 
-def _append_full_completion_records(
+def _append_completion_records(
     path: str | None,
     records: list[dict[str, object]],
 ) -> None:
@@ -479,6 +481,43 @@ def _sampled_validation_completion_records(
                 completion=completion,
                 step=step,
             )
+        )
+    return records
+
+
+def _all_training_completion_records(
+    trajectories: list[Trajectory],
+    *,
+    step_idx: int,
+) -> list[dict[str, object]]:
+    completion_counts: dict[object, int] = {}
+    records: list[dict[str, object]] = []
+    for trajectory in trajectories:
+        completion, step = trajectory.transitions[0]
+        metadata = _step_metadata(step)
+        problem_id = metadata.get("problem_id")
+        completion_id = completion_counts.get(problem_id, 0)
+        completion_counts[problem_id] = completion_id + 1
+        records.append(
+            {
+                "problem_id": problem_id,
+                "completion_id": completion_id,
+                "policy_version": completion.policy_version,
+                "step": step_idx,
+                "rewards": step.rewards,
+                "total_reward": step.reward,
+                "format_passed": metadata.get("format_passed"),
+                "compilation_passed": metadata.get("compilation_passed"),
+                "func_passed": metadata.get("func_passed"),
+                "num_tests": metadata.get("num_tests"),
+                "num_tests_passed": metadata.get("num_tests_passed"),
+                "format_failure_reason": metadata.get("format_failure_reason"),
+                "prompt_token_count": len(trajectory.prompt_token_ids),
+                "completion_token_count": len(completion.token_ids),
+                "sequence_token_count": len(trajectory.prompt_token_ids) + len(completion.token_ids),
+                "coding_reward_log": metadata.get("coding_reward_log"),
+                "completion_text": completion.text,
+            }
         )
     return records
 
@@ -633,9 +672,13 @@ class RLTrainer(Configurable):
         self.trainer = None
         self.generator = None
         self._proc_meshes = []
-        self.full_completion_log_path = os.path.join(
+        self.sample_completion_log_path = os.path.join(
             output_dir,
-            "full_sample_completions.jsonl",
+            "sample_completions.jsonl",
+        )
+        self.all_completion_log_path = os.path.join(
+            output_dir,
+            "all_completions.jsonl",
         )
         self.final_text_stats_log_path = os.path.join(
             output_dir,
@@ -649,16 +692,37 @@ class RLTrainer(Configurable):
         self.tokenizer = HuggingFaceTokenizer(tokenizer_path=config.hf_assets_path)
         if config.log_samples:
             logger.info(
-                "Full --log_samples completions will be written to %s",
-                self.full_completion_log_path,
+                "--log_samples completions will be written to %s",
+                self.sample_completion_log_path,
             )
+        logger.info(
+            "All training completions will be written to %s",
+            self.all_completion_log_path,
+        )
         logger.info(
             "Per-step final-text completion stats will be written to %s",
             self.final_text_stats_log_path,
         )
 
+    def _generate_gantt_trace(self) -> None:
+        """Best-effort: write Perfetto/Chrome trace before teardown can hang."""
+        structured_log_dir = os.path.join(self.config.dump_folder, "structured_logs")
+        if not os.path.isdir(structured_log_dir):
+            logger.info(
+                "No structured logs found at %s; skipping Gantt trace generation",
+                structured_log_dir,
+            )
+            return
+
+        gantt_trace_path = os.path.join(self.config.dump_folder, "gantt_trace.json")
+        try:
+            generate_gantt_trace(structured_log_dir, gantt_trace_path)
+        except Exception:
+            logger.exception("Gantt trace generation failed")
+
     async def close(self):
         """Best-effort: tear down actors, close metric backends, then stop proc meshes."""
+        self._generate_gantt_trace()
         logger.info("Closing: tearing down actors and process meshes.")
         for actor_name, actor in (
             ("trainer", self.trainer),
@@ -1073,8 +1137,8 @@ class RLTrainer(Configurable):
         if self.config.log_samples:
             _log_samples(completions)
             _log_validation_samples(envs, trajectories)
-            _append_full_completion_records(
-                self.full_completion_log_path,
+            _append_completion_records(
+                self.sample_completion_log_path,
                 _sampled_validation_completion_records(trajectories),
             )
 
@@ -1146,12 +1210,16 @@ class RLTrainer(Configurable):
                 max_response_tokens=self.config.generator.sampling.max_tokens,
                 final_text_stats_path=self.final_text_stats_log_path,
             )
+            _append_completion_records(
+                self.all_completion_log_path,
+                _all_training_completion_records(trajectories, step_idx=step),
+            )
 
             if self.config.log_samples:
                 _log_samples(episodes)
                 _log_training_completion_samples(step, trajectories)
-                _append_full_completion_records(
-                    self.full_completion_log_path,
+                _append_completion_records(
+                    self.sample_completion_log_path,
                     _sampled_training_completion_records(
                         trajectories,
                         step_idx=step,
@@ -1233,6 +1301,11 @@ class RLTrainer(Configurable):
             self.metrics_processor.log(
                 step=step, metrics=step_metrics, is_validation=False
             )
+
+        if self.config.trainer.checkpoint.enable:
+            logger.info("Saving final trainer checkpoint at step %s", num_steps)
+            self.trainer.save_checkpoint.call(step=num_steps, last_step=True).get()
+            logger.info("Finished saving final trainer checkpoint at step %s", num_steps)
 
         post_validation_metrics = await self.validate()
         self.metrics_processor.log(
