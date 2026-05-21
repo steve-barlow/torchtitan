@@ -165,21 +165,152 @@ def grpo_qwen3_0_6b_veribench_medium() -> RLTrainer.Config:
 
 
 def grpo_qwen3_8b_veribench_medium() -> RLTrainer.Config:
-    """Qwen3-8B GRPO smoke run for the medium-difficulty Veribench subset."""
-    config = grpo_qwen3_0_6b_veribench()
+    """Qwen3-8B GRPO run for the medium-difficulty Veribench subset."""
     model_spec = model_registry("8B", attn_backend="varlen")
-    model_spec.model.rope.max_seq_len = 5120
-    config.model_spec = model_spec
-    config.hf_assets_path = "torchtitan/experiments/rl/example_checkpoint/Qwen3-8B"
-    config.num_steps = 5
-    config.env.split = "medium"
-    config.trainer.training.seq_len = 5120
-    config.trainer.checkpoint.last_save_model_only = True
-    config.trainer.checkpoint.last_save_in_hf = True
-    config.trainer.checkpoint.export_dtype = "bfloat16"
-    config.generator.sampling.n = 4
-    config.generator.sampling.max_tokens = 4096
-    return config
+    model_spec.model.rope.max_seq_len = 6144
+    return RLTrainer.Config(
+        model_spec=model_spec,
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-8B",
+        num_steps=5,
+        num_prompts_per_step=4,
+        num_validation_samples=8,
+        env_step_concurrency=4,
+        log_samples=True,
+        metrics=MetricsProcessor.Config(
+            enable_wandb=True,
+            enable_tensorboard=True,
+            wandb_project="ishikori",
+        ),
+        compile=CompileConfig(enable=True, backend="aot_eager"),
+        env=VeribenchEnv.Config(
+            split="medium",
+            seed=42,
+            enable_thinking=True,
+            compilation_credit=0.1,
+        ),
+        validation_env=VeribenchEnv.Config(
+            split="validation",
+            seed=99,
+            enable_thinking=True,
+            compilation_credit=0.1,
+        ),
+        trainer=PolicyTrainer.Config(
+            ac_config=ActivationCheckpointConfig(mode="full"),
+            optimizer=OptimizersContainer.Config(lr=2e-6),
+            lr_scheduler=LRSchedulersContainer.Config(
+                warmup_steps=2,
+                decay_type="linear",
+            ),
+            training=TrainingConfig(seq_len=6144),
+            parallelism=ParallelismConfig(
+                data_parallel_shard_degree=6,
+                tensor_parallel_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
+            ),
+            checkpoint=CheckpointManager.Config(
+                enable=True,
+                initial_load_in_hf=True,
+                interval=10,
+                last_save_model_only=True,
+                last_save_in_hf=True,
+                export_dtype="bfloat16",
+            ),
+            loss=GRPOLoss.Config(),
+        ),
+        generator=VLLMGenerator.Config(
+            model_dtype="bfloat16",
+            parallelism=ParallelismConfig(
+                tensor_parallel_degree=2,
+                data_parallel_replicate_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
+            ),
+            checkpoint=CheckpointManager.Config(enable=False),
+            sampling=SamplingConfig(
+                n=4,
+                temperature=1,
+                top_p=0.95,
+                max_tokens=4096,
+            ),
+        ),
+    )
+
+
+def grpo_qwen3_8b_veribench_medium_multinode() -> RLTrainer.Config:
+    """Qwen3-8B GRPO multinode run for the medium Veribench subset."""
+    model_spec = model_registry("8B", attn_backend="varlen")
+    model_spec.model.rope.max_seq_len = 6144
+    return RLTrainer.Config(
+        model_spec=model_spec,
+        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-8B",
+        num_steps=5,
+        num_prompts_per_step=32, # Number of prompts processed by both the generator and trainer in each step. 
+        num_validation_samples=8,
+        env_step_concurrency=8,
+        log_samples=True,
+        metrics=MetricsProcessor.Config(
+            enable_wandb=True,
+            enable_tensorboard=True,
+            wandb_project="ishikori",
+        ),
+        compile=CompileConfig(enable=True, backend="aot_eager"),
+        env=VeribenchEnv.Config(
+            split="medium",
+            seed=42,
+            enable_thinking=True,
+            compilation_credit=0.1,
+        ),
+        validation_env=VeribenchEnv.Config(
+            split="validation",
+            seed=99,
+            enable_thinking=True,
+            compilation_credit=0.1,
+        ),
+        trainer=PolicyTrainer.Config(
+            ac_config=ActivationCheckpointConfig(mode="full"),
+            optimizer=OptimizersContainer.Config(lr=5e-7),
+            lr_scheduler=LRSchedulersContainer.Config(
+                warmup_steps=15,
+                decay_type="linear",
+            ),
+            training=TrainingConfig(seq_len=6144),
+            parallelism=ParallelismConfig(
+                data_parallel_shard_degree=8,
+                data_parallel_replicate_degree=1,
+                tensor_parallel_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
+            ),
+            checkpoint=CheckpointManager.Config(
+                enable=True,
+                initial_load_in_hf=True,
+                interval=10,
+                last_save_model_only=True,
+                last_save_in_hf=True,
+                export_dtype="bfloat16",
+            ),
+            loss=GRPOLoss.Config(),
+        ),
+        generator=VLLMGenerator.Config(
+            model_dtype="bfloat16",
+            parallelism=ParallelismConfig(
+                data_parallel_shard_degree=1,
+                tensor_parallel_degree=8,
+                data_parallel_replicate_degree=1,
+                enable_sequence_parallel=False,
+                disable_loss_parallel=True,
+            ),
+            checkpoint=CheckpointManager.Config(enable=False),
+            sampling=SamplingConfig(
+                n=4,
+                temperature=1,
+                top_p=0.95,
+                top_k=50,
+                max_tokens=4096,
+            ),
+        ),
+    )
 
 
 def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:

@@ -160,6 +160,9 @@ class SamplingConfig:
     top_p: float = 0.95
     """Nucleus sampling threshold."""
 
+    top_k: int = -1
+    """Top-k sampling cutoff. -1 disables top-k filtering."""
+
     max_tokens: int = 100
     """Maximum number of tokens to generate per completion."""
 
@@ -408,6 +411,7 @@ class VLLMGenerator(Actor, Configurable):
             sampling_params = SamplingParams(
                 temperature=_sampling_config.temperature,
                 top_p=_sampling_config.top_p,
+                top_k=_sampling_config.top_k,
                 max_tokens=_sampling_config.max_tokens,
                 n=_sampling_config.n,
                 seed=self.config.debug.seed,

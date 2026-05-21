@@ -636,6 +636,11 @@ class RLTrainer(Configurable):
         )
 
         def __post_init__(self):
+            # RLTrainer.Config.num_steps is the RL loop source of truth. Keep
+            # the trainer schedule horizon in sync so LR decay/checkpoint state
+            # do not silently use TrainingConfig's generic default.
+            self.trainer.training.steps = self.num_steps
+
             if self.generator.checkpoint.enable:
                 raise ValueError(
                     "Generator checkpoint must be disabled in the RL loop "
