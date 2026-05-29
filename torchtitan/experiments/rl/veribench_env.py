@@ -13,7 +13,6 @@ from typing import Any, Literal, Mapping, cast
 from evalsets.veribench.dataset import VeribenchSplit, load_veribench
 from evalsets.veribench.eval_set import SYSTEM_PROMPT
 from evalsets.veribench.evaluator import count_tests
-from post_training_torchtitan.app import qwen_prompt_formatting
 from post_training_torchtitan.app.grading import (
     CodingReward,
     CodingRewardPassRate,
@@ -52,10 +51,14 @@ class VeribenchEnv(Configurable):
     ) -> None:
         self._config = config
         self._validate_config(config)
-        self.tokenizer = tokenizer if tokenizer is not None else get_tokenizer(config.tokenizer_path)
+        self.tokenizer = (
+            tokenizer if tokenizer is not None else get_tokenizer(config.tokenizer_path)
+        )
         self._examples = load_veribench(config.split)
         if not self._examples:
-            raise ValueError(f"VeribenchEnv selected no examples from {config.split!r} split")
+            raise ValueError(
+                f"VeribenchEnv selected no examples from {config.split!r} split"
+            )
 
         self.problem_id = self._select_problem_id(
             step=step,
@@ -79,14 +82,12 @@ class VeribenchEnv(Configurable):
         if config.split not in (
             "train",
             "validation",
-            "medium",
             "medium_train",
             "medium_validation",
-            "easy_medium",
         ):
             raise ValueError(
-                "split must be 'train', 'validation', 'medium', "
-                "'medium_train', 'medium_validation', or 'easy_medium'"
+                "split must be 'train', 'validation', "
+                "'medium_train', or 'medium_validation'"
             )
         if config.coding_reward not in ("default", "pass_rate"):
             raise ValueError("coding_reward must be 'default' or 'pass_rate'")
@@ -114,9 +115,7 @@ class VeribenchEnv(Configurable):
         epoch = global_idx // len(available_ids)
         offset = global_idx % len(available_ids)
         shuffled_ids = available_ids[:]
-        rng = random.Random(
-            f"{self._config.split}:{self._config.seed}:epoch:{epoch}"
-        )
+        rng = random.Random(f"{self._config.split}:{self._config.seed}:epoch:{epoch}")
         rng.shuffle(shuffled_ids)
         return shuffled_ids[offset]
 
@@ -209,7 +208,9 @@ class VeribenchEnv(Configurable):
                 "func_passed": coding_result.details.get("func_passed"),
                 "num_tests": coding_result.details.get("num_tests", self.num_tests),
                 "num_tests_passed": coding_result.details.get("num_tests_passed", 0),
-                "empty_response": bool(coding_result.details.get("empty_response", False)),
+                "empty_response": bool(
+                    coding_result.details.get("empty_response", False)
+                ),
             }
         )
         return Step(rewards=rewards, done=True, metadata=metadata)
