@@ -8,13 +8,18 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Any, Mapping, cast
+from typing import Any, Literal, Mapping, cast
 
 from evalsets.veribench.dataset import VeribenchSplit, load_veribench
 from evalsets.veribench.eval_set import SYSTEM_PROMPT
 from evalsets.veribench.evaluator import count_tests
 from post_training_torchtitan.app import qwen_prompt_formatting
-from post_training_torchtitan.app.grading import CodingReward, FormatReward
+from post_training_torchtitan.app.grading import (
+    CodingReward,
+    CodingRewardPassRate,
+    FormatReward,
+    length_penalty,
+)
 from torchtitan.config import Configurable
 from torchtitan.experiments.rl.types import Step
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
@@ -31,6 +36,10 @@ class VeribenchEnv(Configurable):
         seed: int = 42
         enable_thinking: bool = True
         compilation_credit: float = 0.1
+        coding_reward: Literal["default", "pass_rate"] = "default"
+        max_len: int = 4050
+        penalised_len: int = 2500
+        max_length_penalty: float = -0.1
 
     def __init__(
         self,
@@ -38,6 +47,7 @@ class VeribenchEnv(Configurable):
         *,
         step: int = 0,
         group_idx: int = 0,
+        num_groups: int = 1,
         tokenizer: TokenizerLike | None = None,
     ) -> None:
         self._config = config
@@ -47,7 +57,11 @@ class VeribenchEnv(Configurable):
         if not self._examples:
             raise ValueError(f"VeribenchEnv selected no examples from {config.split!r} split")
 
-        self.problem_id = self._select_problem_id(step=step, group_idx=group_idx)
+        self.problem_id = self._select_problem_id(
+            step=step,
+            group_idx=group_idx,
+            num_groups=num_groups,
+        )
         example = self._examples[self.problem_id]
         self.question = str(example["question"])
         self.num_tests = count_tests(str(example.get("testbench", "")))
@@ -62,17 +76,49 @@ class VeribenchEnv(Configurable):
     def _validate_config(config: Config) -> None:
         if not config.tokenizer_path:
             raise ValueError("tokenizer_path must be set")
-        if config.split not in ("train", "validation", "medium"):
-            raise ValueError("split must be 'train', 'validation', or 'medium'")
+        if config.split not in (
+            "train",
+            "validation",
+            "medium",
+            "medium_train",
+            "medium_validation",
+            "easy_medium",
+        ):
+            raise ValueError(
+                "split must be 'train', 'validation', 'medium', "
+                "'medium_train', 'medium_validation', or 'easy_medium'"
+            )
+        if config.coding_reward not in ("default", "pass_rate"):
+            raise ValueError("coding_reward must be 'default' or 'pass_rate'")
+        if config.max_len <= 0:
+            raise ValueError("max_len must be positive")
+        if config.penalised_len <= 0:
+            raise ValueError("penalised_len must be positive")
+        if config.penalised_len > config.max_len:
+            raise ValueError("penalised_len must be less than or equal to max_len")
 
-    def _select_problem_id(self, *, step: int = 0, group_idx: int = 0) -> int:
+    def _select_problem_id(
+        self, *, step: int = 0, group_idx: int = 0, num_groups: int = 1
+    ) -> int:
         if step < 0:
             raise ValueError("step must be non-negative")
         if group_idx < 0:
             raise ValueError("group_idx must be non-negative")
+        if num_groups <= 0:
+            raise ValueError("num_groups must be positive")
+        if group_idx >= num_groups:
+            raise ValueError("group_idx must be less than num_groups")
         available_ids = sorted(int(problem_id) for problem_id in self._examples)
-        rng = random.Random(f"{self._config.split}:{self._config.seed}:{step}:{group_idx}")
-        return available_ids[rng.randrange(len(available_ids))]
+        step_offset = max(step - 1, 0)
+        global_idx = step_offset * num_groups + group_idx
+        epoch = global_idx // len(available_ids)
+        offset = global_idx % len(available_ids)
+        shuffled_ids = available_ids[:]
+        rng = random.Random(
+            f"{self._config.split}:{self._config.seed}:epoch:{epoch}"
+        )
+        rng.shuffle(shuffled_ids)
+        return shuffled_ids[offset]
 
     def _format_prompt(self, question: str) -> str:
         messages: list[ChatCompletionMessageParam] = [
@@ -89,10 +135,22 @@ class VeribenchEnv(Configurable):
             ),
         )
 
-    async def step(self, completion: str) -> Step:
+    async def step(
+        self, completion: str, *, completion_token_count: int | None = None
+    ) -> Step:
         self.raw_completion = completion
         format_result = FormatReward().score(completion)
         self.final_text = format_result.code if format_result.passed else ""
+        length_reward = (
+            0.0
+            if completion_token_count is None
+            else length_penalty(
+                completion_token_count,
+                max_len=self._config.max_len,
+                penalised_len=self._config.penalised_len,
+                penalty=self._config.max_length_penalty,
+            )
+        )
 
         metadata: dict[str, Any] = {
             "split": self._config.split,
@@ -105,11 +163,17 @@ class VeribenchEnv(Configurable):
             "format_failure_reason": format_result.failure_reason,
             "final_text": self.final_text,
             "extracted_code": format_result.code,
+            "completion_token_count": completion_token_count,
+            "length_penalty": length_reward,
+            "length_penalty_max_len": self._config.max_len,
+            "length_penalty_penalised_len": self._config.penalised_len,
+            "length_penalty_value": self._config.max_length_penalty,
+            "coding_reward": self._config.coding_reward,
         }
-        rewards = {"format": format_result.reward}
+        rewards = {"format": format_result.reward, "length": length_reward}
 
         if not format_result.passed:
-            self.reward_value = format_result.reward
+            self.reward_value = sum(rewards.values())
             self.reward_details = metadata
             metadata.update(
                 {
@@ -123,10 +187,12 @@ class VeribenchEnv(Configurable):
             )
             return Step(rewards=rewards, done=True, metadata=metadata)
 
-        reward = CodingReward(
-            qwen_prompt_formatting,
-            compilation_credit=self._config.compilation_credit,
+        reward_cls = (
+            CodingRewardPassRate
+            if self._config.coding_reward == "pass_rate"
+            else CodingReward
         )
+        reward = reward_cls(compilation_credit=self._config.compilation_credit)
         coding_result = await reward.score_with_details(
             prompt=self.question,
             response=format_result.code,

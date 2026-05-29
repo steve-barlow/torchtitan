@@ -93,7 +93,7 @@ def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
         model_spec=model_spec,
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=100,
-        num_prompts_per_step=4,
+        num_prompts_per_step=6,
         num_validation_samples=8,
         env_step_concurrency=4,
         log_samples=True,
@@ -108,12 +108,20 @@ def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
             seed=42,
             enable_thinking=True,
             compilation_credit=0.1,
+            max_len=4050,
+            penalised_len=2500,
+            # Turn off length penalty
+            max_length_penalty=0.0,
         ),
         validation_env=VeribenchEnv.Config(
             split="validation",
             seed=99,
             enable_thinking=True,
             compilation_credit=0.1,
+            max_len=4050,
+            penalised_len=2500,
+            # Turn off length penalty
+            max_length_penalty=0.0,
         ),
         trainer=PolicyTrainer.Config(
             ac_config=ActivationCheckpointConfig(mode="full"),
@@ -159,94 +167,23 @@ def grpo_qwen3_0_6b_veribench() -> RLTrainer.Config:
 def grpo_qwen3_0_6b_veribench_medium() -> RLTrainer.Config:
     """Qwen3-0.6B GRPO run for the medium-difficulty Veribench subset."""
     config = grpo_qwen3_0_6b_veribench()
-    config.num_steps = 5
+    config.num_steps = 1069
     config.env.split = "medium"
+    config.trainer.checkpoint.last_save_model_only = True
+    config.trainer.checkpoint.last_save_in_hf = True
     return config
 
-
 def grpo_qwen3_8b_veribench_medium() -> RLTrainer.Config:
-    """Qwen3-8B GRPO run for the medium-difficulty Veribench subset."""
-    model_spec = model_registry("8B", attn_backend="varlen")
-    model_spec.model.rope.max_seq_len = 6144
-    return RLTrainer.Config(
-        model_spec=model_spec,
-        hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-8B",
-        num_steps=5,
-        num_prompts_per_step=4,
-        num_validation_samples=8,
-        env_step_concurrency=4,
-        log_samples=True,
-        metrics=MetricsProcessor.Config(
-            enable_wandb=True,
-            enable_tensorboard=True,
-            wandb_project="ishikori",
-        ),
-        compile=CompileConfig(enable=True, backend="aot_eager"),
-        env=VeribenchEnv.Config(
-            split="medium",
-            seed=42,
-            enable_thinking=True,
-            compilation_credit=0.1,
-        ),
-        validation_env=VeribenchEnv.Config(
-            split="validation",
-            seed=99,
-            enable_thinking=True,
-            compilation_credit=0.1,
-        ),
-        trainer=PolicyTrainer.Config(
-            ac_config=ActivationCheckpointConfig(mode="full"),
-            optimizer=OptimizersContainer.Config(lr=2e-6),
-            lr_scheduler=LRSchedulersContainer.Config(
-                warmup_steps=2,
-                decay_type="linear",
-            ),
-            training=TrainingConfig(seq_len=6144),
-            parallelism=ParallelismConfig(
-                data_parallel_shard_degree=6,
-                tensor_parallel_degree=1,
-                enable_sequence_parallel=False,
-                disable_loss_parallel=True,
-            ),
-            checkpoint=CheckpointManager.Config(
-                enable=True,
-                initial_load_in_hf=True,
-                interval=10,
-                last_save_model_only=True,
-                last_save_in_hf=True,
-                export_dtype="bfloat16",
-            ),
-            loss=GRPOLoss.Config(),
-        ),
-        generator=VLLMGenerator.Config(
-            model_dtype="bfloat16",
-            parallelism=ParallelismConfig(
-                tensor_parallel_degree=2,
-                data_parallel_replicate_degree=1,
-                enable_sequence_parallel=False,
-                disable_loss_parallel=True,
-            ),
-            checkpoint=CheckpointManager.Config(enable=False),
-            sampling=SamplingConfig(
-                n=4,
-                temperature=1,
-                top_p=0.95,
-                max_tokens=4096,
-            ),
-        ),
-    )
-
-
-def grpo_qwen3_8b_veribench_medium_multinode() -> RLTrainer.Config:
     """Qwen3-8B GRPO multinode run for the medium Veribench subset."""
     model_spec = model_registry("8B", attn_backend="varlen")
-    model_spec.model.rope.max_seq_len = 6144
+    model_spec.model.rope.max_seq_len = 32768
     return RLTrainer.Config(
         model_spec=model_spec,
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-8B",
-        num_steps=5,
-        num_prompts_per_step=32, # Number of prompts processed by both the generator and trainer in each step. 
-        num_validation_samples=8,
+        num_steps=250,
+        num_prompts_per_step=6,
+        num_validation_samples=48,
+        validation_interval=50,
         env_step_concurrency=8,
         log_samples=True,
         metrics=MetricsProcessor.Config(
@@ -256,27 +193,33 @@ def grpo_qwen3_8b_veribench_medium_multinode() -> RLTrainer.Config:
         ),
         compile=CompileConfig(enable=True, backend="aot_eager"),
         env=VeribenchEnv.Config(
-            split="medium",
+            split="medium_train",
             seed=42,
             enable_thinking=True,
             compilation_credit=0.1,
+            coding_reward="default",
+            # Turn off length penalty
+            max_length_penalty=0.0
         ),
         validation_env=VeribenchEnv.Config(
-            split="validation",
+            split="medium_validation",
             seed=99,
             enable_thinking=True,
             compilation_credit=0.1,
+            coding_reward="default",
+            # Turn off length penalty
+            max_length_penalty=0.0,
         ),
         trainer=PolicyTrainer.Config(
             ac_config=ActivationCheckpointConfig(mode="full"),
-            optimizer=OptimizersContainer.Config(lr=5e-7),
+            optimizer=OptimizersContainer.Config(lr=2e-6),
             lr_scheduler=LRSchedulersContainer.Config(
-                warmup_steps=15,
+                warmup_steps=8,
                 decay_type="linear",
             ),
-            training=TrainingConfig(seq_len=6144),
+            training=TrainingConfig(seq_len=32768),
             parallelism=ParallelismConfig(
-                data_parallel_shard_degree=8,
+                data_parallel_shard_degree=32,
                 data_parallel_replicate_degree=1,
                 tensor_parallel_degree=1,
                 enable_sequence_parallel=False,
@@ -285,10 +228,9 @@ def grpo_qwen3_8b_veribench_medium_multinode() -> RLTrainer.Config:
             checkpoint=CheckpointManager.Config(
                 enable=True,
                 initial_load_in_hf=True,
-                interval=10,
+                interval=75,
                 last_save_model_only=True,
                 last_save_in_hf=True,
-                export_dtype="bfloat16",
             ),
             loss=GRPOLoss.Config(),
         ),
@@ -303,15 +245,27 @@ def grpo_qwen3_8b_veribench_medium_multinode() -> RLTrainer.Config:
             ),
             checkpoint=CheckpointManager.Config(enable=False),
             sampling=SamplingConfig(
-                n=4,
+                n=8,
                 temperature=1,
                 top_p=0.95,
-                top_k=50,
-                max_tokens=4096,
+                max_tokens=31000,
             ),
         ),
     )
 
+
+def grpo_qwen3_8b_veribench_medium_multinode_resume() -> RLTrainer.Config:
+    """Resume the Qwen3-8B medium multinode run from a saved checkpoint."""
+    config = grpo_qwen3_8b_veribench_medium()
+    # Edit this checkpoint path before launching a resume run.
+    config.trainer.checkpoint.initial_load_path = (
+        "/data/seanc/ishikori/post_training_torchtitan/outputs/"
+        "28-05-26-10-35-07/checkpoint/step-75"
+    )
+    config.trainer.checkpoint.initial_load_model_only = False
+    config.trainer.checkpoint.initial_load_in_hf = False
+    config.trainer.checkpoint.load_step = -1
+    return config
 
 def rl_grpo_qwen3_1_7b() -> RLTrainer.Config:
     """GRPO training config for Qwen3-1.7B (6 GPUs: 4 gen + 2 train)."""

@@ -274,6 +274,11 @@ class PolicyTrainer(Actor, Configurable):
         self.policy_version = state_dict["policy_version"]
 
     @endpoint
+    async def get_policy_version(self) -> int:
+        """Return the loaded trainer policy version for RL resume bookkeeping."""
+        return self.policy_version
+
+    @endpoint
     async def close(self) -> None:
         """Destroy the worker's torch.distributed process group."""
         if torch.distributed.is_initialized():
