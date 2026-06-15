@@ -47,8 +47,19 @@ Assistant: Break each number into digits:
 Sum all digits: 1 + 2 + 3 + 4 + 5 + 6 + 7 = 28
 [ANSWER] 28"""
 
-    def __init__(self, config: Config, *, step: int = 0, group_idx: int = 0):
+    def __init__(
+        self,
+        config: Config,
+        *,
+        step: int = 0,
+        group_idx: int = 0,
+        num_groups: int = 1,
+        absolute_group_idx: int | None = None,
+    ):
         self._config = config
+        del num_groups
+        if absolute_group_idx is not None:
+            group_idx = absolute_group_idx
         rng = random.Random(f"{config.seed}:{step}:{group_idx}")
         n = rng.randint(2, 4)
         numbers = [rng.randint(10, 99) for _ in range(n)]

@@ -22,6 +22,7 @@ python3 torchtitan/experiments/rl/grpo.py \
 """
 
 import asyncio
+import gc
 import inspect
 import json
 import logging
@@ -53,6 +54,10 @@ from torchtitan.experiments.rl.actors.generator import SamplingConfig, VLLMGener
 from torchtitan.experiments.rl.actors.trainer import PolicyTrainer
 from torchtitan.experiments.rl.batcher import Batcher
 from torchtitan.experiments.rl.observability import metrics as m
+from torchtitan.experiments.rl.zero_std_filter import (
+    filter_zero_std_groups,
+    num_groups_in_trajectories,
+)
 from torchtitan.experiments.rl.types import (
     Completion,
     Episode,
@@ -289,6 +294,44 @@ def _step_metadata(step: Step) -> dict[str, object]:
     return step.metadata or {}
 
 
+def _controller_rss_gb() -> float | None:
+    try:
+        with open('/proc/self/status', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) / (1024.0 * 1024.0)
+    except OSError:
+        return None
+    return None
+
+
+def _log_controller_rss(stage: str) -> float | None:
+    rss_gb = _controller_rss_gb()
+    if rss_gb is None:
+        return None
+    logger.info('Controller RSS at %s: %.2f GiB', stage, rss_gb)
+    sl.log_trace_scalar({f'controller/rss_gb/{stage}': rss_gb}, stacklevel=3)
+    return rss_gb
+
+
+def _trim_step_metadata(step: Step, *, keep_rich_payloads: bool) -> None:
+    if keep_rich_payloads:
+        return
+    metadata = step.metadata
+    if not metadata:
+        return
+    for key in ('question', 'final_text', 'extracted_code', 'coding_reward_log'):
+        metadata.pop(key, None)
+
+
+def _trim_completion_payload(completion: Completion, *, keep_rich_payloads: bool) -> None:
+    if keep_rich_payloads:
+        return
+    completion.text = ''
+
+
 def _append_jsonl_record(path: str | None, record: dict[str, object]) -> None:
     if not path:
         return
@@ -431,9 +474,10 @@ def _full_completion_record(
     prompt_token_ids: list[int],
     completion: Completion,
     step: Step,
+    include_rich_payloads: bool,
 ) -> dict[str, object]:
     metadata = _step_metadata(step)
-    return {
+    record = {
         "split": split,
         "step": step_idx,
         "prompt_idx": completion.prompt_idx,
@@ -450,13 +494,19 @@ def _full_completion_record(
         "prompt_token_count": len(prompt_token_ids),
         "completion_token_count": len(completion.token_ids),
         "sequence_token_count": len(prompt_token_ids) + len(completion.token_ids),
-        "question": metadata.get("question"),
-        "final_text": metadata.get("final_text"),
-        "extracted_code": metadata.get("extracted_code"),
         "coding_failure_reason": metadata.get("coding_failure_reason"),
-        "coding_reward_log": metadata.get("coding_reward_log"),
-        "completion_text": completion.text,
     }
+    if include_rich_payloads:
+        record.update(
+            {
+                "question": metadata.get("question"),
+                "final_text": metadata.get("final_text"),
+                "extracted_code": metadata.get("extracted_code"),
+                "coding_reward_log": metadata.get("coding_reward_log"),
+                "completion_text": completion.text,
+            }
+        )
+    return record
 
 
 def _append_completion_records(
@@ -475,6 +525,7 @@ def _sampled_training_completion_records(
     trajectories: list[Trajectory],
     *,
     step_idx: int,
+    include_rich_payloads: bool,
 ) -> list[dict[str, object]]:
     seen_prompts: set[int] = set()
     records = []
@@ -490,6 +541,7 @@ def _sampled_training_completion_records(
                 prompt_token_ids=trajectory.prompt_token_ids,
                 completion=completion,
                 step=step,
+                include_rich_payloads=include_rich_payloads,
             )
         )
     return records
@@ -499,6 +551,7 @@ def _sampled_validation_completion_records(
     trajectories: list[Trajectory],
     *,
     max_samples: int = 2,
+    include_rich_payloads: bool,
 ) -> list[dict[str, object]]:
     records = []
     for trajectory in trajectories[:max_samples]:
@@ -510,6 +563,7 @@ def _sampled_validation_completion_records(
                 prompt_token_ids=trajectory.prompt_token_ids,
                 completion=completion,
                 step=step,
+                include_rich_payloads=include_rich_payloads,
             )
         )
     return records
@@ -519,6 +573,7 @@ def _all_training_completion_records(
     trajectories: list[Trajectory],
     *,
     step_idx: int,
+    include_rich_payloads: bool,
 ) -> list[dict[str, object]]:
     completion_counts: dict[object, int] = {}
     records: list[dict[str, object]] = []
@@ -545,10 +600,15 @@ def _all_training_completion_records(
                 "prompt_token_count": len(trajectory.prompt_token_ids),
                 "completion_token_count": len(completion.token_ids),
                 "sequence_token_count": len(trajectory.prompt_token_ids) + len(completion.token_ids),
-                "coding_reward_log": metadata.get("coding_reward_log"),
-                "completion_text": completion.text,
             }
         )
+        if include_rich_payloads:
+            records[-1].update(
+                {
+                    "coding_reward_log": metadata.get("coding_reward_log"),
+                    "completion_text": completion.text,
+                }
+            )
     return records
 
 
@@ -650,6 +710,12 @@ class RLTrainer(Configurable):
         log_samples: bool = False
         """Log first completion per episode during training and validation."""
 
+        log_rich_completions: bool = False
+        """Include full text/debug payloads in completion JSONL logs."""
+
+        filter_zero_std_groups: bool = False
+        """Drop prompt groups whose completions all have identical reward."""
+
         env_step_concurrency: int = 4
         """Maximum number of env.step calls to run concurrently."""
 
@@ -725,6 +791,10 @@ class RLTrainer(Configurable):
             output_dir,
             "final_text_completion_stats.jsonl",
         )
+        self.batcher_kept_completion_log_path = os.path.join(
+            output_dir,
+            "batcher_kept_completions.jsonl",
+        )
         resolved_config_path = os.path.join(output_dir, "resolved_config.json")
         resolved_config_json = json.dumps(
             config.to_dict(),
@@ -749,6 +819,8 @@ class RLTrainer(Configurable):
         self.tokenizer = HuggingFaceTokenizer(tokenizer_path=config.hf_assets_path)
         # TODO: Use tokenizer.pad_id when available, falling back to eos_id.
         self.batcher = Batcher(config.batcher, pad_id=self.tokenizer.eos_id)
+        self._train_prompt_cursor = 0
+        self._train_prompt_pending_indices: list[int] = []
 
         if config.log_samples:
             logger.info(
@@ -756,12 +828,20 @@ class RLTrainer(Configurable):
                 self.sample_completion_log_path,
             )
         logger.info(
+            "Rich completion payload logging is %s",
+            "enabled" if config.log_rich_completions else "disabled",
+        )
+        logger.info(
             "All training completions will be written to %s",
             self.all_completion_log_path,
         )
         logger.info(
             "Per-step final-text completion stats will be written to %s",
             self.final_text_stats_log_path,
+        )
+        logger.info(
+            "Batcher kept-completion metadata will be written to %s",
+            self.batcher_kept_completion_log_path,
         )
 
     def _generate_gantt_trace(self) -> None:
@@ -1021,12 +1101,116 @@ class RLTrainer(Configurable):
             self._get_rank_0_value(self.trainer.get_policy_version.call().get())
         )
 
+    def _get_trainer_train_prompt_cursor(self) -> int | None:
+        if self.trainer is None:
+            return None
+        cursor = self._get_rank_0_value(
+            self.trainer.get_train_prompt_cursor.call().get()
+        )
+        return None if cursor is None else int(cursor)
+
+    def _get_trainer_train_prompt_pending_indices(self) -> list[int] | None:
+        if self.trainer is None:
+            return None
+        pending_indices = self._get_rank_0_value(
+            self.trainer.get_train_prompt_pending_indices.call().get()
+        )
+        if pending_indices is None:
+            return None
+        return [int(index) for index in pending_indices]
+
+    def _sync_trainer_prompt_sampling_state(self) -> None:
+        if self.trainer is None:
+            return
+        self.trainer.set_train_prompt_cursor.call(self._train_prompt_cursor).get()
+        self.trainer.set_train_prompt_pending_indices.call(
+            self._train_prompt_pending_indices
+        ).get()
+
+    def _train_env_accepts_absolute_prompt_indices(self) -> bool:
+        return self._env_accepts_build_kwarg("absolute_group_idx")
+
+    def _next_train_prompt_indices(self, num_groups: int) -> list[int]:
+        if num_groups <= 0:
+            raise ValueError("num_groups must be positive")
+
+        num_pending = min(num_groups, len(self._train_prompt_pending_indices))
+        prompt_indices = self._train_prompt_pending_indices[:num_pending]
+        del self._train_prompt_pending_indices[:num_pending]
+
+        while len(prompt_indices) < num_groups:
+            prompt_indices.append(self._train_prompt_cursor)
+            self._train_prompt_cursor += 1
+
+        return prompt_indices
+
+    def _requeue_unadmitted_prompt_indices(
+        self,
+        sampled_prompt_indices: list[int],
+        kept_completion_records: list[dict],
+    ) -> None:
+        if not sampled_prompt_indices:
+            return
+
+        admitted_prompt_indices = {
+            int(record["prompt_stream_idx"])
+            for record in kept_completion_records
+            if record.get("prompt_stream_idx") is not None
+        }
+        already_pending = set(self._train_prompt_pending_indices)
+        requeued_prompt_indices: list[int] = []
+        for prompt_index in sampled_prompt_indices:
+            if prompt_index in admitted_prompt_indices:
+                continue
+            if prompt_index in already_pending:
+                continue
+            requeued_prompt_indices.append(prompt_index)
+            already_pending.add(prompt_index)
+
+        if not requeued_prompt_indices:
+            return
+
+        self._train_prompt_pending_indices.extend(requeued_prompt_indices)
+        logger.info(
+            "Requeued %s sampled prompts not admitted by batcher truncation; pending queue size is now %s",
+            len(requeued_prompt_indices),
+            len(self._train_prompt_pending_indices),
+        )
+
+    def _env_accepts_build_kwarg(self, name: str) -> bool:
+        owner = getattr(self.config.env, "_owner", None)
+        if owner is None:
+            return False
+        try:
+            return name in inspect.signature(owner.__init__).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _build_training_env(
+        self,
+        *,
+        step: int,
+        group_idx: int,
+        num_groups: int,
+        absolute_group_idx: int | None = None,
+    ) -> object:
+        kwargs = {"step": step, "group_idx": group_idx}
+        if self._env_accepts_build_kwarg("num_groups"):
+            kwargs["num_groups"] = num_groups
+        if absolute_group_idx is not None and self._env_accepts_build_kwarg(
+            "absolute_group_idx"
+        ):
+            kwargs["absolute_group_idx"] = absolute_group_idx
+        return self.config.env.build(**kwargs)
+
     @sl.log_trace_span("_collect_rollouts")
     async def _collect_rollouts(
         self,
         num_groups: int,
         step: int,
         group_offset: int = 0,
+        absolute_group_offset: int | None = None,
+        absolute_group_indices: list[int] | None = None,
     ) -> tuple[list[Trajectory], list[m.Metric]]:
         """Collect group rollouts and emit completion-shape rollout metrics.
 
@@ -1035,9 +1219,43 @@ class RLTrainer(Configurable):
             step: Current training step (passed to env for curriculum).
             group_offset: Starting group index so that env ``group_idx``
                 values are unique across collection rounds within a step.
+            absolute_group_offset: Optional absolute prompt cursor used by envs
+                that support monotonically increasing prompt selection across
+                kept and dropped groups.
+            absolute_group_indices: Optional explicit absolute prompt indices.
+                This supports retrying prompts that were sampled but not
+                admitted by batcher row truncation.
         """
+        if absolute_group_offset is not None and absolute_group_indices is not None:
+            raise ValueError(
+                "absolute_group_offset and absolute_group_indices are mutually exclusive"
+            )
+        if absolute_group_indices is not None and len(absolute_group_indices) != num_groups:
+            raise ValueError("absolute_group_indices must have num_groups entries")
+
+        env_accepts_absolute_group_idx = self._env_accepts_build_kwarg(
+            "absolute_group_idx"
+        )
+        effective_absolute_group_indices: list[int] | None = None
+        if env_accepts_absolute_group_idx:
+            if absolute_group_indices is not None:
+                effective_absolute_group_indices = absolute_group_indices
+            elif absolute_group_offset is not None:
+                effective_absolute_group_indices = [
+                    absolute_group_offset + i for i in range(num_groups)
+                ]
+
         envs = [
-            self.config.env.build(step=step, group_idx=group_offset + i)
+            self._build_training_env(
+                step=step,
+                group_idx=i if env_accepts_absolute_group_idx else group_offset + i,
+                num_groups=num_groups,
+                absolute_group_idx=(
+                    max(step - 1, 0) * num_groups + group_offset + i
+                    if effective_absolute_group_indices is None
+                    else effective_absolute_group_indices[i]
+                ),
+            )
             for i in range(num_groups)
         ]
         # TODO: Add a check max_tokens = min(max_tokens, context_window - model_input.length)
@@ -1057,9 +1275,17 @@ class RLTrainer(Configurable):
                 completions,
                 concurrency=self.config.env_step_concurrency,
             )
+        keep_rich_payloads = self.config.log_samples or self.config.log_rich_completions
+        for completion, step_result in completion_steps:
+            _trim_step_metadata(step_result, keep_rich_payloads=keep_rich_payloads)
+            _trim_completion_payload(completion, keep_rich_payloads=keep_rich_payloads)
         trajectories = [
             Trajectory(
-                sample_idx=group_offset + c.prompt_idx,
+                sample_idx=(
+                    group_offset + c.prompt_idx
+                    if effective_absolute_group_indices is None
+                    else effective_absolute_group_indices[c.prompt_idx]
+                ),
                 prompt_token_ids=tokenized_prompts[c.prompt_idx],
                 transitions=[(c, step_result)],
             )
@@ -1085,6 +1311,53 @@ class RLTrainer(Configurable):
         )
         return trajectories, rollout_metrics
 
+    async def _collect_filtered_rollouts(
+        self,
+        num_groups: int,
+        step: int,
+    ) -> tuple[list[Trajectory], list[m.Metric], list[int]]:
+        trajectories: list[Trajectory] = []
+        rollout_metrics: list[m.Metric] = []
+        sampled_prompt_indices: list[int] = []
+        groups_dropped_zero_std = 0
+        collected_tokens = 0
+        group_offset = 0
+        num_tokens_target = self.batcher.num_tokens_target(self.trainer_dp_degree)
+
+        while collected_tokens < num_tokens_target:
+            prompt_indices = (
+                self._next_train_prompt_indices(num_groups)
+                if self._train_env_accepts_absolute_prompt_indices()
+                else None
+            )
+            new_trajectories, new_metrics = await self._collect_rollouts(
+                num_groups,
+                step=step,
+                group_offset=group_offset,
+                absolute_group_indices=prompt_indices,
+            )
+            if prompt_indices is not None:
+                sampled_prompt_indices.extend(prompt_indices)
+            group_offset += num_groups
+            filter_result = filter_zero_std_groups(new_trajectories)
+            kept_trajectories = filter_result.kept_trajectories
+            trajectories.extend(kept_trajectories)
+            rollout_metrics.extend(new_metrics)
+            groups_dropped_zero_std += filter_result.dropped_groups
+            collected_tokens += sum(
+                len(t.prompt_token_ids) + len(c.token_ids) - 1
+                for t in kept_trajectories
+                for c, _ in t.transitions
+            )
+
+        rollout_metrics.append(
+            m.Metric(
+                "rollout/groups_dropped_zero_std",
+                m.NoReduce(float(groups_dropped_zero_std)),
+            )
+        )
+        return trajectories, rollout_metrics, sampled_prompt_indices
+
     @staticmethod
     @sl.log_trace_span("_build_episodes")
     def _build_episodes(
@@ -1102,9 +1375,10 @@ class RLTrainer(Configurable):
             group_mean = sum(rewards) / len(rewards)
             # Population standard deviation; NaN for an empty group.
             group_stds.append(statistics.pstdev(float(r) for r in rewards))
-            for t in group:
+            for completion_id, t in enumerate(group):
                 # Single-turn: exactly one (completion, step) per trajectory.
-                c, _ = t.transitions[0]
+                c, step = t.transitions[0]
+                metadata = _step_metadata(step)
                 episodes.append(
                     Episode(
                         policy_version=c.policy_version,
@@ -1115,6 +1389,11 @@ class RLTrainer(Configurable):
                         token_logprobs=c.token_logprobs,
                         reward=t.total_reward,
                         advantage=t.total_reward - group_mean,
+                        prompt_stream_idx=sample_idx,
+                        problem_id=metadata.get("problem_id"),
+                        completion_id=completion_id,
+                        completion_token_count=len(c.token_ids),
+                        sequence_token_count=len(t.prompt_token_ids) + len(c.token_ids),
                     )
                 )
 
@@ -1192,6 +1471,10 @@ class RLTrainer(Configurable):
             completions,
             concurrency=self.config.env_step_concurrency,
         )
+        keep_rich_payloads = self.config.log_samples or self.config.log_rich_completions
+        for completion, step_result in completion_steps:
+            _trim_step_metadata(step_result, keep_rich_payloads=keep_rich_payloads)
+            _trim_completion_payload(completion, keep_rich_payloads=keep_rich_payloads)
         trajectories = [
             Trajectory(
                 sample_idx=c.prompt_idx,
@@ -1218,7 +1501,10 @@ class RLTrainer(Configurable):
             _log_validation_samples(envs, trajectories)
             _append_completion_records(
                 self.sample_completion_log_path,
-                _sampled_validation_completion_records(trajectories),
+                _sampled_validation_completion_records(
+                    trajectories,
+                    include_rich_payloads=self.config.log_rich_completions,
+                ),
             )
 
         validation_metrics: list[m.Metric] = [
@@ -1246,6 +1532,25 @@ class RLTrainer(Configurable):
         num_groups = self.config.num_prompts_per_step
         resume_step = self._get_trainer_policy_version()
         start_step = resume_step + 1
+        restored_prompt_cursor = self._get_trainer_train_prompt_cursor()
+        restored_pending_indices = self._get_trainer_train_prompt_pending_indices()
+        if restored_prompt_cursor is None:
+            self._train_prompt_cursor = resume_step * num_groups
+            if resume_step > 0:
+                logger.warning(
+                    "Trainer checkpoint has no train_prompt_cursor; using approximate prompt cursor %s from policy_version=%s and num_prompts_per_step=%s",
+                    self._train_prompt_cursor,
+                    resume_step,
+                    num_groups,
+                )
+        else:
+            self._train_prompt_cursor = restored_prompt_cursor
+        self._train_prompt_pending_indices = restored_pending_indices or []
+        logger.info(
+            "Training prompt sampling state: cursor=%s pending=%s",
+            self._train_prompt_cursor,
+            len(self._train_prompt_pending_indices),
+        )
         if resume_step > 0:
             logger.info(
                 "Resuming RL training from policy version %s; next step is %s; target final step is %s",
@@ -1284,34 +1589,59 @@ class RLTrainer(Configurable):
             await asyncio.sleep(0)
 
             t_step_start = time.perf_counter()
+            controller_rss_pre_rollout = _log_controller_rss('pre_rollout')
 
             # --- rollouts ---
             # Collect rollouts until total response tokens reach the
             # token budget. The Batcher then packs, truncates to
             # global_batch_size rows, and splits into microbatches.
             t_rollout_start = time.perf_counter()
-            trajectories: list[Trajectory] = []
-            rollout_metrics: list[m.Metric] = []
-            collected_tokens = 0
-            group_offset = 0
-            # num_tokens_target (= global_batch_size * seq_len) is the stop
-            # condition for collected tokens before a train step can proceed.
-            # NOTE: this is a proxy -- packing adds padding to fill fixed-length
-            # rows, so actual token consumption may exceed collected_tokens.
-            num_tokens_target = self.batcher.num_tokens_target(self.trainer_dp_degree)
-            while collected_tokens < num_tokens_target:
-                new_trajectories, new_metrics = await self._collect_rollouts(
-                    num_groups, step=step, group_offset=group_offset
+            if self.config.filter_zero_std_groups:
+                trajectories, rollout_metrics, sampled_prompt_indices = (
+                    await self._collect_filtered_rollouts(num_groups, step=step)
                 )
-                trajectories.extend(new_trajectories)
-                rollout_metrics.extend(new_metrics)
-                # Both prompt length and completion length are counted.
-                collected_tokens += sum(
-                    len(t.prompt_token_ids) + len(c.token_ids) - 1
-                    for t in new_trajectories
-                    for c, _ in t.transitions
+            else:
+                trajectories = []
+                rollout_metrics = []
+                sampled_prompt_indices: list[int] = []
+                collected_tokens = 0
+                group_offset = 0
+                # num_tokens_target (= global_batch_size * seq_len) is the stop
+                # condition for collected tokens before a train step can proceed.
+                # NOTE: this is a proxy -- packing adds padding to fill fixed-length
+                # rows, so actual token consumption may exceed collected_tokens.
+                num_tokens_target = self.batcher.num_tokens_target(
+                    self.trainer_dp_degree
                 )
-                group_offset += num_groups
+                while collected_tokens < num_tokens_target:
+                    prompt_indices = (
+                        self._next_train_prompt_indices(num_groups)
+                        if self._train_env_accepts_absolute_prompt_indices()
+                        else None
+                    )
+                    new_trajectories, new_metrics = await self._collect_rollouts(
+                        num_groups,
+                        step=step,
+                        group_offset=group_offset,
+                        absolute_group_indices=prompt_indices,
+                    )
+                    if prompt_indices is not None:
+                        sampled_prompt_indices.extend(prompt_indices)
+                    trajectories.extend(new_trajectories)
+                    rollout_metrics.extend(new_metrics)
+                    # Both prompt length and completion length are counted.
+                    collected_tokens += sum(
+                        len(t.prompt_token_ids) + len(c.token_ids) - 1
+                        for t in new_trajectories
+                        for c, _ in t.transitions
+                    )
+                    group_offset += num_groups
+                rollout_metrics.append(
+                    m.Metric(
+                        "rollout/groups_dropped_zero_std",
+                        m.NoReduce(0.0),
+                    )
+                )
 
             episodes, episode_metrics = self._build_episodes(trajectories)
             t_rollout_s = time.perf_counter() - t_rollout_start
@@ -1319,14 +1649,18 @@ class RLTrainer(Configurable):
             _log_training_step_diagnostics(
                 step,
                 trajectories,
-                num_prompts=num_groups,
+                num_prompts=num_groups_in_trajectories(trajectories),
                 completions_per_prompt=self.config.generator.sampling.n,
                 max_response_tokens=self.config.generator.sampling.max_tokens,
                 final_text_stats_path=self.final_text_stats_log_path,
             )
             _append_completion_records(
                 self.all_completion_log_path,
-                _all_training_completion_records(trajectories, step_idx=step),
+                _all_training_completion_records(
+                    trajectories,
+                    step_idx=step,
+                    include_rich_payloads=self.config.log_rich_completions,
+                ),
             )
 
             if self.config.log_samples:
@@ -1337,6 +1671,7 @@ class RLTrainer(Configurable):
                     _sampled_training_completion_records(
                         trajectories,
                         step_idx=step,
+                        include_rich_payloads=self.config.log_rich_completions,
                     ),
                 )
 
@@ -1347,7 +1682,20 @@ class RLTrainer(Configurable):
                     microbatches,
                     num_global_valid_tokens,
                     packing_metrics,
+                    kept_completion_records,
                 ) = self.batcher.batch(episodes, dp_degree=self.trainer_dp_degree)
+
+            for record in kept_completion_records:
+                record["step"] = step
+            _append_completion_records(
+                self.batcher_kept_completion_log_path, kept_completion_records
+            )
+            self._requeue_unadmitted_prompt_indices(
+                sampled_prompt_indices, kept_completion_records
+            )
+
+            with sl.log_trace_span("trainer_begin_train_step_call"):
+                self.trainer.begin_train_step.call().get()
 
             # Aggregate metrics across gradient-accumulation microbatches.
             # "/mean" and "/frac" metrics are pre-normalized by
@@ -1398,6 +1746,13 @@ class RLTrainer(Configurable):
             )
 
             step_metrics: list[m.Metric] = []
+            if controller_rss_pre_rollout is not None:
+                step_metrics.append(
+                    m.Metric(
+                        'controller/rss_gb/pre_rollout',
+                        m.NoReduce(controller_rss_pre_rollout),
+                    )
+                )
 
             step_metrics += rollout_metrics
             step_metrics += episode_metrics
@@ -1430,6 +1785,29 @@ class RLTrainer(Configurable):
                 step=step, metrics=step_metrics, is_validation=False
             )
 
+            del trajectories
+            del episodes
+            del microbatches
+            del kept_completion_records
+            del sampled_prompt_indices
+            del rollout_metrics
+            del episode_metrics
+            del packing_metrics
+            del step_metrics
+            gc.collect()
+            controller_rss_post_cleanup = _log_controller_rss('post_cleanup')
+            if controller_rss_post_cleanup is not None:
+                self.metrics_processor.log(
+                    step=step,
+                    metrics=[
+                        m.Metric(
+                            'controller/rss_gb/post_cleanup',
+                            m.NoReduce(controller_rss_post_cleanup),
+                        )
+                    ],
+                    is_validation=False,
+                )
+
             checkpoint_interval = self.config.trainer.checkpoint.interval
             if (
                 self.config.trainer.checkpoint.enable
@@ -1438,6 +1816,7 @@ class RLTrainer(Configurable):
                 and step != num_steps
             ):
                 logger.info("Saving periodic trainer checkpoint at step %s", step)
+                self._sync_trainer_prompt_sampling_state()
                 self.trainer.save_checkpoint.call(step=step, last_step=False).get()
                 logger.info(
                     "Finished saving periodic trainer checkpoint at step %s", step
@@ -1459,6 +1838,7 @@ class RLTrainer(Configurable):
 
         if self.config.trainer.checkpoint.enable:
             logger.info("Saving final trainer checkpoint at step %s", num_steps)
+            self._sync_trainer_prompt_sampling_state()
             self.trainer.save_checkpoint.call(step=num_steps, last_step=True).get()
             logger.info("Finished saving final trainer checkpoint at step %s", num_steps)
 

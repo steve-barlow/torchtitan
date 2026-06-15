@@ -47,6 +47,7 @@ class VeribenchEnv(Configurable):
         step: int = 0,
         group_idx: int = 0,
         num_groups: int = 1,
+        absolute_group_idx: int | None = None,
         tokenizer: TokenizerLike | None = None,
     ) -> None:
         self._config = config
@@ -64,6 +65,7 @@ class VeribenchEnv(Configurable):
             step=step,
             group_idx=group_idx,
             num_groups=num_groups,
+            absolute_group_idx=absolute_group_idx,
         )
         example = self._examples[self.problem_id]
         self.question = str(example["question"])
@@ -99,7 +101,12 @@ class VeribenchEnv(Configurable):
             raise ValueError("penalised_len must be less than or equal to max_len")
 
     def _select_problem_id(
-        self, *, step: int = 0, group_idx: int = 0, num_groups: int = 1
+        self,
+        *,
+        step: int = 0,
+        group_idx: int = 0,
+        num_groups: int = 1,
+        absolute_group_idx: int | None = None,
     ) -> int:
         if step < 0:
             raise ValueError("step must be non-negative")
@@ -107,11 +114,16 @@ class VeribenchEnv(Configurable):
             raise ValueError("group_idx must be non-negative")
         if num_groups <= 0:
             raise ValueError("num_groups must be positive")
+        if absolute_group_idx is not None and absolute_group_idx < 0:
+            raise ValueError("absolute_group_idx must be non-negative")
         if group_idx >= num_groups:
             raise ValueError("group_idx must be less than num_groups")
         available_ids = sorted(int(problem_id) for problem_id in self._examples)
-        step_offset = max(step - 1, 0)
-        global_idx = step_offset * num_groups + group_idx
+        if absolute_group_idx is None:
+            step_offset = max(step - 1, 0)
+            global_idx = step_offset * num_groups + group_idx
+        else:
+            global_idx = absolute_group_idx
         epoch = global_idx // len(available_ids)
         offset = global_idx % len(available_ids)
         shuffled_ids = available_ids[:]

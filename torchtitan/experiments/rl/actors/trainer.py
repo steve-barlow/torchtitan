@@ -233,6 +233,8 @@ class PolicyTrainer(Actor, Configurable):
         )
 
         self.policy_version = 0
+        self.train_prompt_cursor: int | None = 0
+        self.train_prompt_pending_indices: list[int] | None = []
 
         # Always build CheckpointManager; enable is a field on the config.
         # When enable=False (CI/debug), load() is a no-op and random init stands.
@@ -298,15 +300,52 @@ class PolicyTrainer(Actor, Configurable):
             logger.exception("Failed to write trainer CUDA memory snapshot")
 
     def state_dict(self) -> dict[str, Any]:
-        return {"policy_version": self.policy_version}
+        return {
+            "policy_version": self.policy_version,
+            "train_prompt_cursor": self.train_prompt_cursor,
+            "train_prompt_pending_indices": self.train_prompt_pending_indices,
+        }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.policy_version = state_dict["policy_version"]
+        self.train_prompt_cursor = state_dict.get("train_prompt_cursor")
+        self.train_prompt_pending_indices = state_dict.get(
+            "train_prompt_pending_indices"
+        )
 
     @endpoint
     async def get_policy_version(self) -> int:
         """Return the loaded trainer policy version for RL resume bookkeeping."""
         return self.policy_version
+
+    @endpoint
+    async def get_train_prompt_cursor(self) -> int | None:
+        """Return the loaded train prompt cursor, if present in checkpoint state."""
+        return self.train_prompt_cursor
+
+    @endpoint
+    async def set_train_prompt_cursor(self, cursor: int) -> None:
+        """Persist the next fresh training prompt index in checkpoint state."""
+        if cursor < 0:
+            raise ValueError("train prompt cursor must be non-negative")
+        self.train_prompt_cursor = cursor
+
+    @endpoint
+    async def get_train_prompt_pending_indices(self) -> list[int] | None:
+        """Return sampled prompt indices waiting for retry after truncation."""
+        if self.train_prompt_pending_indices is None:
+            return None
+        return list(self.train_prompt_pending_indices)
+
+    @endpoint
+    async def set_train_prompt_pending_indices(
+        self, pending_indices: list[int]
+    ) -> None:
+        """Persist sampled prompt indices waiting for retry after truncation."""
+        normalized_indices = [int(index) for index in pending_indices]
+        if any(index < 0 for index in normalized_indices):
+            raise ValueError("train prompt pending indices must be non-negative")
+        self.train_prompt_pending_indices = normalized_indices
 
     @endpoint
     async def close(self) -> None:
@@ -410,6 +449,13 @@ class PolicyTrainer(Actor, Configurable):
         return out
 
     @endpoint
+    @sl.log_trace_span("begin_train_step")
+    async def begin_train_step(self) -> None:
+        """Prepare optimizer state for a new accumulated training step."""
+        self.optimizers.zero_grad()
+        self._log_cuda_memory("after_zero_grad", step=self.policy_version + 1)
+
+    @endpoint
     @sl.log_trace_span("forward_backward")
     async def forward_backward(
         self,
@@ -479,8 +525,6 @@ class PolicyTrainer(Actor, Configurable):
             )
         self._log_cuda_memory("after_loss_fn", step=self.policy_version + 1)
 
-        self.optimizers.zero_grad()
-        self._log_cuda_memory("after_zero_grad", step=self.policy_version + 1)
         with sl.log_trace_span("model_backward"):
             loss.backward()
         self._log_cuda_memory("after_model_backward", step=self.policy_version + 1)

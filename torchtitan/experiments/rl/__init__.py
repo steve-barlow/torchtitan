@@ -32,11 +32,19 @@ To register TorchTitan models with vLLM:
     )
 """
 
-from torchtitan.experiments.rl.models.vllm_registry import registry_to_vllm
-from torchtitan.experiments.rl.models.vllm_wrapper import VLLMModelWrapper
-
-
 __all__ = [
     "VLLMModelWrapper",
     "registry_to_vllm",  # Export register function for manual use
 ]
+
+
+def __getattr__(name: str):
+    if name == "registry_to_vllm":
+        from torchtitan.experiments.rl.models.vllm_registry import registry_to_vllm
+
+        return registry_to_vllm
+    if name == "VLLMModelWrapper":
+        from torchtitan.experiments.rl.models.vllm_wrapper import VLLMModelWrapper
+
+        return VLLMModelWrapper
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -10,7 +10,12 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
+try:
+    from torchtitan.distributed.pipeline_parallel import pipeline_llm
+except ModuleNotFoundError as exc:
+    if exc.name != "torch.distributed._mesh_layout":
+        raise
+    pipeline_llm = None
 from torchtitan.models.common import Embedding, Linear, RoPE, TransformerBlock
 from torchtitan.models.common.config_utils import (
     get_attention_config,

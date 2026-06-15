@@ -21,17 +21,18 @@ def pack(
     samples: Iterable[dict[str, list]],
     max_seq_length: int,
     pad_values: dict[str, int | float | bool],
-) -> Iterator[dict[str, torch.Tensor]]:
+) -> Iterator[dict]:
     """Greedy-pack variable-length samples into [1, max_seq_length] sequences."""
     keys = list(pad_values.keys())
     dtypes: dict[str, torch.dtype] | None = None
     buffer: dict[str, list] = {key: [] for key in keys}
     position_buffer: list[int] = []
     seq_lens_buffer: list[int] = []
+    metadata_buffer: list[dict] = []
     buffer_length = 0
 
     def _flush() -> dict:
-        nonlocal buffer, position_buffer, seq_lens_buffer, buffer_length
+        nonlocal buffer, position_buffer, seq_lens_buffer, metadata_buffer, buffer_length
         assert dtypes is not None
         pad_length = max_seq_length - buffer_length
         if pad_length > 0:
@@ -50,10 +51,12 @@ def pack(
             0
         )
         result["seq_lens"] = list(seq_lens_buffer)
+        result["metadata"] = list(metadata_buffer)
 
         buffer = {key: [] for key in keys}
         position_buffer = []
         seq_lens_buffer = []
+        metadata_buffer = []
         buffer_length = 0
         return result
 
@@ -78,6 +81,7 @@ def pack(
             buffer[key].extend(sample[key])
         position_buffer.extend(range(sample_length))
         seq_lens_buffer.append(sample_length)
+        metadata_buffer.append(dict(sample.get("metadata", {})))
         buffer_length += sample_length
 
     if buffer_length > 0:
@@ -132,7 +136,7 @@ class Batcher(Configurable):
         episodes: list[Episode],
         *,
         dp_degree: int,
-    ) -> tuple[list[list[TrainingBatch]], int, list[m.Metric]]:
+    ) -> tuple[list[list[TrainingBatch]], int, list[m.Metric], list[dict]]:
         """Pack episodes into ``[B, seq_len]`` microbatches.
 
         Returns:
@@ -142,6 +146,8 @@ class Batcher(Configurable):
                 (excludes padding). Used to normalize the loss so that
                 gradient accumulation matches a single large-batch step.
             packing_metrics: list of Metric objects for logging.
+            kept_completion_records: compact metadata for completions whose
+                packed rows survived global_batch_size truncation.
         """
         # TODO: Consider consuming the iterator lazily instead of
         # materializing all rows upfront.
@@ -163,6 +169,13 @@ class Batcher(Configurable):
         gradient_accumulation_steps = global_batch_size // (
             self.local_batch_size * dp_degree
         )
+
+        kept_completion_records: list[dict] = []
+        for packed_row_idx, row in enumerate(packed_rows):
+            for metadata in row.get("metadata", []):
+                record = dict(metadata)
+                record["packed_row_idx"] = packed_row_idx
+                kept_completion_records.append(record)
 
         num_global_valid_tokens = sum(
             int(row["loss_mask"].sum().item()) for row in packed_rows
@@ -201,7 +214,7 @@ class Batcher(Configurable):
             ),
         ]
 
-        return microbatches, num_global_valid_tokens, packing_metrics
+        return microbatches, num_global_valid_tokens, packing_metrics, kept_completion_records
 
     def _pack_episodes(self, episodes: list[Episode]) -> Iterator[dict]:
         """Pack all episodes into [1, seq_len] rows.
@@ -225,6 +238,15 @@ class Batcher(Configurable):
                     "generator_logprobs": gen_lp[1:],
                     "loss_mask": loss_mask[1:],
                     "advantages": advantages[1:],
+                    "metadata": {
+                        "prompt_stream_idx": ep.prompt_stream_idx,
+                        "problem_id": ep.problem_id,
+                        "completion_id": ep.completion_id,
+                        "reward": ep.reward,
+                        "advantage": ep.advantage,
+                        "completion_token_count": ep.completion_token_count,
+                        "sequence_token_count": ep.sequence_token_count,
+                    },
                 }
 
         yield from pack(

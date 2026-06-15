@@ -88,6 +88,11 @@ class Episode:
     token_logprobs: list[float]
     reward: float
     advantage: float
+    prompt_stream_idx: int | None = None
+    problem_id: int | None = None
+    completion_id: int | None = None
+    completion_token_count: int | None = None
+    sequence_token_count: int | None = None
 
 
 @dataclass(kw_only=True, slots=True)
